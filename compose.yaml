@@ -1,0 +1,24 @@
+name: ${COMPOSE_PROJECT_NAME:-mcp-whatsapp}
+services:
+  whatsapp:
+    image: ${WHATSAPP_IMAGE:-mcp-whatsapp:local}
+    build:
+      context: .
+      args:
+        VERSION: ${MCP_VERSION:-dev}
+    container_name: whatsapp-sealjay
+    restart: unless-stopped
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    ports:
+      - "127.0.0.1:8765:8765"
+    env_file:
+      - ./deployment/secrets/whatsapp.env
+    environment:
+      TZ: Europe/Madrid
+      WHATSAPP_MCP_MEDIA_ROOT: ${WHATSAPP_UPLOADS_PATH:?Run python3 ops/init_local.py first}
+    volumes:
+      - ./deployment/store:/home/app/store:z
+      - ./deployment/store/uploads:${WHATSAPP_UPLOADS_PATH:?Run python3 ops/init_local.py first}:z
+    command: [serve, -addr, "0.0.0.0:8765", -allow-remote]

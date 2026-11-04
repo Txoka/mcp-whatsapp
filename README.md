@@ -1,3 +1,5 @@
+> Fork: compact history, verified participant identities, mention metadata, unread-state queries and event-driven waits. See [fork changes](docs/FORK_CHANGES.md) and [local setup](docs/LOCAL_SETUP.md).
+
 # WhatsApp MCP Server
 
 [![License: MIT](https://img.shields.io/github/license/Sealjay/mcp-whatsapp)](LICENSE)

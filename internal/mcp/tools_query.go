@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"os"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
@@ -21,6 +23,8 @@ func (s *Server) registerQueryTools() {
 	s.registerIsOnWhatsApp()
 	s.registerGetStatus()
 	s.registerPairingStatus()
+	s.registerUnreadChats()
+	s.registerWaitUpdates()
 }
 
 // -- search_contacts --------------------------------------------------------
@@ -50,6 +54,11 @@ func (s *Server) registerSearchContacts() {
 // -- list_messages ----------------------------------------------------------
 
 type listMessagesArgs struct {
+	UnreadOnly        bool   `json:"unread_only,omitempty"`
+	Cursor            string `json:"cursor,omitempty"`
+	AutoSync          *bool  `json:"auto_sync,omitempty"`
+	Format            string `json:"format,omitempty"`
+	Timezone          string `json:"timezone,omitempty"`
 	After             string `json:"after,omitempty"`
 	Before            string `json:"before,omitempty"`
 	SenderPhoneNumber string `json:"sender_phone_number,omitempty"`
@@ -64,23 +73,41 @@ type listMessagesArgs struct {
 
 func (s *Server) registerListMessages() {
 	tool := mcp.NewTool("list_messages",
-		mcp.WithDescription(offlineSafePrefix+"Search and page through cached WhatsApp messages, optionally filtering by chat, sender, time range, and substring; can include surrounding context messages. Read-only; no side effects. Use get_message_context to expand around a single known message ID, or request_sync to backfill missing history. Returns a human-readable formatted text block listing matching messages."),
-		mcp.WithString("after", mcp.Description("ISO-8601 UTC lower bound on message timestamp (inclusive)")),
-		mcp.WithString("before", mcp.Description("ISO-8601 UTC upper bound on message timestamp (inclusive)")),
+		mcp.WithBoolean("unread_only", mcp.DefaultBool(false), mcp.Description("only incoming messages with known unread identities/read watermarks; phone counts may include messages not identified in cache")),
+		mcp.WithString("cursor", mcp.Description("Opaque next-page cursor returned by a previous query; reuse the same filters")),
+		mcp.WithBoolean("auto_sync", mcp.DefaultBool(true), mcp.Description("automatically try to load missing older history for a selected chat; false for strictly cache-only diagnostics")),
+		mcp.WithString("format", mcp.Enum("compact", "detailed"), mcp.DefaultString("compact"), mcp.Description("compact: readable messages without transport IDs (default); detailed: exact message/chat IDs needed for replies, reactions, downloads or diagnostics")),
+		mcp.WithString("timezone", mcp.Description("IANA timezone for compact timestamps, e.g. Europe/Madrid; defaults to server TZ, otherwise UTC")),
+		mcp.WithDescription("Read WhatsApp messages with automatic bounded history loading for a selected chat. Returns compact local-time messages and an opaque next-page cursor when available. An incomplete cache is reported explicitly; never interpret it as an empty conversation. Does not send chat messages or mark anything read. Use detailed format only when exact transport IDs are needed."),
+		mcp.WithString("after", mcp.Description("ISO-8601 lower bound on message timestamp (exclusive; include timezone)")),
+		mcp.WithString("before", mcp.Description("ISO-8601 upper bound on message timestamp (exclusive; include timezone)")),
 		mcp.WithString("sender_phone_number", mcp.Description("filter to messages sent by this phone or JID ("+jidDesc+")")),
 		mcp.WithString("chat_jid", mcp.Description("filter to messages in this chat ("+jidDesc+")")),
 		mcp.WithString("query", mcp.Description("case-insensitive substring to match within message body")),
 		mcp.WithNumber("limit", mcp.DefaultNumber(20), mcp.Description("max messages to return (default 20, capped at 100 server-side)")),
-		mcp.WithNumber("page", mcp.DefaultNumber(0), mcp.Description("zero-based page index for paging through results (default 0)")),
-		mcp.WithBoolean("include_context", mcp.DefaultBool(true), mcp.Description("if true, attach a few surrounding messages to each match (defaults to true)")),
+		mcp.WithNumber("page", mcp.DefaultNumber(0), mcp.Description("legacy zero-based page index; prefer the returned next-page cursor")),
+		mcp.WithBoolean("include_context", mcp.DefaultBool(false), mcp.Description("if true, add surrounding messages to search matches; overlapping windows are deduplicated. Defaults to false for normal chat history")),
 		mcp.WithNumber("context_before", mcp.DefaultNumber(1), mcp.Description("messages to include before each match (default 1, capped at 20 server-side)")),
 		mcp.WithNumber("context_after", mcp.DefaultNumber(1), mcp.Description("messages to include after each match (default 1, capped at 20 server-side)")),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithIdempotentHintAnnotation(true),
-		mcp.WithOpenWorldHintAnnotation(false),
+		mcp.WithOpenWorldHintAnnotation(true),
 	)
 	s.mcp.AddTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a listMessagesArgs) (*mcp.CallToolResult, error) {
+		if a.Format != "" && a.Format != "compact" && a.Format != "detailed" {
+			return mcp.NewToolResultError("format must be compact or detailed"), nil
+		}
+		timezone := a.Timezone
+		if timezone == "" {
+			timezone = os.Getenv("TZ")
+		}
+		if timezone == "" {
+			timezone = "UTC"
+		}
+		if _, err := time.LoadLocation(timezone); err != nil {
+			return mcp.NewToolResultError("timezone: unknown IANA timezone"), nil
+		}
 		// Clamp parameters to server-side upper bounds.
 		limit := a.Limit
 		if limit > 100 {
@@ -95,12 +122,13 @@ func (s *Server) registerListMessages() {
 			ctxAfter = 20
 		}
 		params := store.ListMessagesParams{
+			UnreadOnly:     a.UnreadOnly,
 			SenderPhone:    a.SenderPhoneNumber,
 			ChatJID:        a.ChatJID,
 			Query:          a.Query,
 			Limit:          limit,
 			Page:           a.Page,
-			IncludeContext: a.IncludeContext == nil || *a.IncludeContext,
+			IncludeContext: a.IncludeContext != nil && *a.IncludeContext,
 			ContextBefore:  ctxBefore,
 			ContextAfter:   ctxAfter,
 		}
@@ -118,11 +146,29 @@ func (s *Server) registerListMessages() {
 			}
 			params.Before = t
 		}
-		msgs, err := s.client.Store().ListMessages(ctx, params)
+		if err := applyCursor(&params, a.Cursor); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		auto := a.AutoSync == nil || *a.AutoSync
+		msgs, status, cursor, err := s.history.read(ctx, s.client, params, auto)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		return mcp.NewToolResultText(s.client.Store().FormatMessagesList(ctx, msgs, true)), nil
+		if a.UnreadOnly {
+			overview, overviewErr := s.client.Store().UnreadChats(ctx, a.ChatJID, 100)
+			if overviewErr != nil {
+				return mcp.NewToolResultError(overviewErr.Error()), nil
+			}
+			status = overview.Note
+		}
+		if a.Format == "detailed" {
+			return mcp.NewToolResultText(readingFooter(s.client.Store().FormatMessagesList(ctx, msgs, true), status, cursor)), nil
+		}
+		text, err := s.client.Store().FormatMessagesCompact(ctx, msgs, timezone)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return mcp.NewToolResultText(readingFooter(text, status, cursor)), nil
 	}))
 }
 
@@ -196,6 +242,7 @@ func (s *Server) registerGetChat() {
 // -- get_message_context ----------------------------------------------------
 
 type getMessageContextArgs struct {
+	ChatJID   string `json:"chat_jid,omitempty"`
 	MessageID string `json:"message_id"`
 	Before    int    `json:"before,omitempty"`
 	After     int    `json:"after,omitempty"`
@@ -204,6 +251,7 @@ type getMessageContextArgs struct {
 func (s *Server) registerGetMessageContext() {
 	tool := mcp.NewTool("get_message_context",
 		mcp.WithDescription(offlineSafePrefix+"Fetch a specific cached message and the surrounding messages in its chat. Read-only; no side effects. Use list_messages for searching across many chats. Returns a JSON object with the target message and arrays of messages before and after it."),
+		mcp.WithString("chat_jid", mcp.Description("Chat containing the message; required when the message ID occurs in multiple chats")),
 		mcp.WithString("message_id", mcp.Required(), mcp.Description("WhatsApp message ID of the target message (use `message_id` from list_messages)")),
 		mcp.WithNumber("before", mcp.DefaultNumber(5), mcp.Description("messages to fetch before the target (default 5; non-positive values fall back to the default)")),
 		mcp.WithNumber("after", mcp.DefaultNumber(5), mcp.Description("messages to fetch after the target (default 5; non-positive values fall back to the default)")),
@@ -220,10 +268,17 @@ func (s *Server) registerGetMessageContext() {
 		if after <= 0 {
 			after = 5
 		}
-		ctxResult, err := s.client.Store().GetMessageContext(ctx, a.MessageID, before, after)
+		if before > 100 {
+			before = 100
+		}
+		if after > 100 {
+			after = 100
+		}
+		ctxResult, err := s.client.Store().GetMessageContext(ctx, a.MessageID, before, after, a.ChatJID)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
+		_, ctxResult.Message.Mentions, ctxResult.Message.MentionsMe = s.client.Store().RenderMentions(ctx, ctxResult.Message, true)
 		return resultJSON(ctxResult)
 	}))
 }
@@ -243,11 +298,10 @@ func (s *Server) registerIsOnWhatsApp() {
 		mcp.WithIdempotentHintAnnotation(true),
 		mcp.WithOpenWorldHintAnnotation(true),
 	)
-	s.mcp.AddTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, req mcp.CallToolRequest, a isOnWhatsAppArgs) (*mcp.CallToolResult, error) {
+	s.mcp.AddTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a isOnWhatsAppArgs) (*mcp.CallToolResult, error) {
 		if len(a.Phones) == 0 {
 			return mcp.NewToolResultError("phones must not be empty"), nil
 		}
-		ctx = withRateLimitOverride(ctx, req)
 		m, err := s.client.IsOnWhatsApp(ctx, a.Phones)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -331,4 +385,14 @@ func (s *Server) registerPairingStatus() {
 		}
 		return resultJSON(resp)
 	})
+}
+
+func readingFooter(text, status, cursor string) string {
+	if status != "" {
+		text += "\nHistory: " + status + "\n"
+	}
+	if cursor != "" {
+		text += "\nNext: " + cursor + "\n"
+	}
+	return text
 }

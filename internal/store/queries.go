@@ -16,6 +16,10 @@ const listMessageColumns = "messages.timestamp, messages.sender, chats.name, mes
 // ListMessagesParams holds the filters accepted by ListMessages. Zero values
 // mean "unset" except for Limit, which defaults to 20 when <= 0.
 type ListMessagesParams struct {
+	UnreadOnly     bool
+	CursorTime     time.Time
+	CursorChat     string
+	CursorID       string
 	After          time.Time
 	Before         time.Time
 	SenderPhone    string
@@ -45,17 +49,27 @@ func (s *Store) ListMessages(ctx context.Context, params ListMessagesParams) ([]
 		args         []any
 	)
 
+	if params.UnreadOnly {
+		whereClauses = append(whereClauses, knownUnreadSQL)
+	}
+	if !params.CursorTime.IsZero() {
+		whereClauses = append(whereClauses, "(messages.timestamp < ? OR (messages.timestamp = ? AND (messages.chat_jid > ? OR (messages.chat_jid = ? AND messages.id < ?))))")
+		args = append(args, params.CursorTime, params.CursorTime, params.CursorChat, params.CursorChat, params.CursorID)
+	}
 	if !params.After.IsZero() {
 		whereClauses = append(whereClauses, "messages.timestamp > ?")
-		args = append(args, params.After)
+		args = append(args, params.After.UTC())
 	}
 	if !params.Before.IsZero() {
 		whereClauses = append(whereClauses, "messages.timestamp < ?")
-		args = append(args, params.Before)
+		args = append(args, params.Before.UTC())
 	}
 	if params.SenderPhone != "" {
-		whereClauses = append(whereClauses, "messages.sender = ?")
-		args = append(args, params.SenderPhone)
+		// Live/history ingestion stores bare users, while imported rows may
+		// contain full JIDs. Match exact representations, never substrings.
+		resolved := s.ResolveLIDToJID(params.SenderPhone)
+		whereClauses = append(whereClauses, "messages.sender IN (?, ?, ?, ?, ?)")
+		args = append(args, params.SenderPhone, jidUser(params.SenderPhone), resolved, jidUser(resolved), jidUser(resolved)+"@s.whatsapp.net")
 	}
 	if params.ChatJID != "" {
 		whereClauses = append(whereClauses, "messages.chat_jid = ?")
@@ -73,7 +87,7 @@ func (s *Store) ListMessages(ctx context.Context, params ListMessagesParams) ([]
 		b.WriteString(" WHERE ")
 		b.WriteString(strings.Join(whereClauses, " AND "))
 	}
-	b.WriteString(" ORDER BY messages.timestamp DESC")
+	b.WriteString(" ORDER BY messages.timestamp DESC, messages.chat_jid ASC, messages.id DESC")
 	b.WriteString(" LIMIT ? OFFSET ?")
 
 	offset := page * limit
@@ -110,17 +124,42 @@ func (s *Store) ListMessages(ctx context.Context, params ListMessagesParams) ([]
 		after = 1
 	}
 
-	// Expand context: before messages (DESC), the match, after messages (ASC).
+	// Context windows overlap. Keep one row per (chat, message), then restore
+	// the same newest-first order as the unexpanded query. Scope each window
+	// to its match's chat, even if another chat has the same message ID.
 	var expanded []Message
+	seen := make(map[[2]string]bool)
+	appendUnique := func(messages []Message) {
+		for _, message := range messages {
+			key := [2]string{message.ChatJID, message.ID}
+			if !seen[key] {
+				seen[key] = true
+				expanded = append(expanded, message)
+			}
+		}
+	}
 	for _, m := range result {
-		c, err := s.GetMessageContext(ctx, m.ID, before, after)
+		prior, err := s.queryContextWindow(ctx, m.ChatJID, m.Timestamp, m.ID, before, false)
 		if err != nil {
 			return nil, err
 		}
-		expanded = append(expanded, c.Before...)
-		expanded = append(expanded, c.Message)
-		expanded = append(expanded, c.After...)
+		next, err := s.queryContextWindow(ctx, m.ChatJID, m.Timestamp, m.ID, after, true)
+		if err != nil {
+			return nil, err
+		}
+		appendUnique(prior)
+		appendUnique([]Message{m})
+		appendUnique(next)
 	}
+	sort.Slice(expanded, func(i, j int) bool {
+		if !expanded[i].Timestamp.Equal(expanded[j].Timestamp) {
+			return expanded[i].Timestamp.After(expanded[j].Timestamp)
+		}
+		if expanded[i].ChatJID != expanded[j].ChatJID {
+			return expanded[i].ChatJID < expanded[j].ChatJID
+		}
+		return expanded[i].ID > expanded[j].ID
+	})
 	return expanded, nil
 }
 
@@ -143,9 +182,9 @@ func (s *Store) ListChats(ctx context.Context, query string, limit, page int, in
 	}
 
 	if sortBy == "name" {
-		b.WriteString(" ORDER BY chats.name")
+		b.WriteString(" ORDER BY chats.name, chats.jid")
 	} else {
-		b.WriteString(" ORDER BY chats.last_message_time DESC")
+		b.WriteString(" ORDER BY chats.last_message_time DESC, chats.jid")
 	}
 
 	b.WriteString(" LIMIT ? OFFSET ?")
@@ -163,6 +202,7 @@ func (s *Store) ListChats(ctx context.Context, query string, limit, page int, in
 		if err != nil {
 			return nil, err
 		}
+		c.Name = s.ChatDisplayName(c.JID, c.Name)
 		c.PhoneNumber = s.ResolveJIDToPhone(c.JID)
 		result = append(result, c)
 	}
@@ -186,6 +226,7 @@ func (s *Store) GetChat(ctx context.Context, jid string, includeLastMessage bool
 		}
 		return nil, fmt.Errorf("get chat: %w", err)
 	}
+	c.Name = s.ChatDisplayName(c.JID, c.Name)
 	c.PhoneNumber = s.ResolveJIDToPhone(c.JID)
 	return &c, nil
 }
@@ -256,12 +297,23 @@ func (s *Store) SearchContacts(ctx context.Context, query string) ([]Contact, er
 
 // GetMessageContext returns the target message together with before/after
 // windows from the same chat.
-func (s *Store) GetMessageContext(ctx context.Context, messageID string, before, after int) (*MessageContext, error) {
+func (s *Store) GetMessageContext(ctx context.Context, messageID string, before, after int, chatFilter ...string) (*MessageContext, error) {
+	filter := ""
+	if len(chatFilter) > 0 {
+		filter = chatFilter[0]
+	}
+	var count int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM messages WHERE id=? AND (?='' OR chat_jid=?)", messageID, filter, filter).Scan(&count); err != nil {
+		return nil, err
+	}
+	if count > 1 {
+		return nil, fmt.Errorf("message ID is ambiguous; provide chat_jid")
+	}
 	row := s.db.QueryRowContext(ctx, `
 		SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type
 		FROM messages
 		JOIN chats ON messages.chat_jid = chats.jid
-		WHERE messages.id = ?`, messageID)
+		WHERE messages.id = ? AND (? = '' OR messages.chat_jid = ?)`, messageID, filter, filter)
 
 	var (
 		ts        time.Time
@@ -294,11 +346,11 @@ func (s *Store) GetMessageContext(ctx context.Context, messageID string, before,
 	target.IsGroup = strings.HasSuffix(target.ChatJID, "@g.us")
 	target.SenderPhone = s.resolveSenderPhone(target.Sender)
 
-	beforeMsgs, err := s.queryContextWindow(ctx, msgChat, ts, before, false)
+	beforeMsgs, err := s.queryContextWindow(ctx, msgChat, ts, id, before, false)
 	if err != nil {
 		return nil, err
 	}
-	afterMsgs, err := s.queryContextWindow(ctx, msgChat, ts, after, true)
+	afterMsgs, err := s.queryContextWindow(ctx, msgChat, ts, id, after, true)
 	if err != nil {
 		return nil, err
 	}
@@ -315,26 +367,21 @@ func (s *Store) GetMessageContext(ctx context.Context, messageID string, before,
 // names are often just the bare phone number. Falls back to the input value
 // if no name is found.
 func (s *Store) GetSenderName(ctx context.Context, senderJID string) string {
-	if name := s.ContactName(senderJID); name != "" {
-		return name
+	if senderJID == "" || strings.HasSuffix(senderJID, "@g.us") {
+		return "Unknown participant"
 	}
-	if name := s.chatNameByJID(ctx, senderJID); name != "" {
-		return name
+	candidates := []string{senderJID}
+	if !strings.Contains(senderJID, "@") {
+		candidates = append(candidates, senderJID+"@s.whatsapp.net", senderJID+"@lid")
 	}
-
-	phonePart := jidUser(senderJID)
-
-	// Prefer an exact direct-chat match on phone + @s.whatsapp.net before
-	// falling back to a LIKE — the LIKE can cross-match unrelated rows.
-	if name := s.chatNameByJID(ctx, phonePart+"@s.whatsapp.net"); name != "" {
-		return name
-	}
-
-	var name2 sql.NullString
-	err := s.db.QueryRowContext(ctx,
-		"SELECT name FROM chats WHERE jid LIKE ? LIMIT 1", "%"+phonePart+"%").Scan(&name2)
-	if err == nil && name2.Valid && name2.String != "" {
-		return name2.String
+	for _, jid := range candidates {
+		if name := s.ContactName(jid); name != "" {
+			return name
+		}
+		resolved := s.ResolveLIDToJID(jid)
+		if name := s.chatNameByJID(ctx, resolved); name != "" {
+			return name
+		}
 	}
 	return senderJID
 }
@@ -352,7 +399,7 @@ func (s *Store) chatNameByJID(ctx context.Context, jid string) string {
 
 // queryContextWindow fetches `limit` messages in chat either strictly before
 // (ascending=false) or strictly after (ascending=true) the anchor timestamp.
-func (s *Store) queryContextWindow(ctx context.Context, chatJID string, anchor time.Time, limit int, ascending bool) ([]Message, error) {
+func (s *Store) queryContextWindow(ctx context.Context, chatJID string, anchor time.Time, anchorID string, limit int, ascending bool) ([]Message, error) {
 	op := "<"
 	order := "DESC"
 	if ascending {
@@ -363,11 +410,11 @@ func (s *Store) queryContextWindow(ctx context.Context, chatJID string, anchor t
 		SELECT `+listMessageColumns+`
 		FROM messages
 		JOIN chats ON messages.chat_jid = chats.jid
-		WHERE messages.chat_jid = ? AND messages.timestamp %s ?
-		ORDER BY messages.timestamp %s
-		LIMIT ?`, op, order)
+		WHERE messages.chat_jid = ? AND (messages.timestamp %s ? OR (messages.timestamp = ? AND messages.id %s ?))
+		ORDER BY messages.timestamp %s, messages.id %s
+		LIMIT ?`, op, op, order, order)
 
-	rows, err := s.db.QueryContext(ctx, q, chatJID, anchor, limit)
+	rows, err := s.db.QueryContext(ctx, q, chatJID, anchor.UTC(), anchor.UTC(), anchorID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("context window: %w", err)
 	}

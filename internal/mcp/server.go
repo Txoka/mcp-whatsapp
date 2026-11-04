@@ -21,9 +21,10 @@ type pairingCache interface {
 // Server holds the MCP server, its bound WhatsApp client, and an optional
 // pairing cache (used only by pairing_status).
 type Server struct {
-	client *client.Client
-	mcp    *server.MCPServer
-	cache  pairingCache
+	client  *client.Client
+	mcp     *server.MCPServer
+	cache   pairingCache
+	history historyReader
 }
 
 // NewServer constructs an MCP server with all tools registered against the

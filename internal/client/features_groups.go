@@ -79,7 +79,11 @@ func (c *Client) ListJoinedGroups(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("list joined groups: %w", err)
 	}
-	b, err := json.Marshal(groups)
+	summaries := make([]groupSummary, 0, len(groups))
+	for _, g := range groups {
+		summaries = append(summaries, groupSummary{g.JID.String(), g.Name, len(g.Participants)})
+	}
+	b, err := json.MarshalIndent(summaries, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("marshal groups: %w", err)
 	}
@@ -87,7 +91,7 @@ func (c *Client) ListJoinedGroups(ctx context.Context) (string, error) {
 }
 
 // GetGroupInfoJSON returns a JSON-encoded types.GroupInfo for the given chat.
-func (c *Client) GetGroupInfoJSON(ctx context.Context, chatJID string) (string, error) {
+func (c *Client) GetGroupInfoJSON(ctx context.Context, chatJID string, pagination ...int) (string, error) {
 	if !c.wa.IsConnected() {
 		return "", errors.New("not connected to WhatsApp")
 	}
@@ -99,7 +103,14 @@ func (c *Client) GetGroupInfoJSON(ctx context.Context, chatJID string) (string, 
 	if err != nil {
 		return "", fmt.Errorf("get group info: %w", err)
 	}
-	b, err := json.Marshal(info)
+	limit, page := 50, 0
+	if len(pagination) > 0 {
+		limit = pagination[0]
+	}
+	if len(pagination) > 1 {
+		page = pagination[1]
+	}
+	b, err := json.MarshalIndent(c.groupView(info, limit, page), "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("marshal group info: %w", err)
 	}
@@ -461,17 +472,10 @@ func buildGroupInviteMessage(chat types.JID, groupName, caption string, req *typ
 	return &waE2E.Message{GroupInviteMessage: invite}
 }
 
-// inviteParticipant sends the group invite for a privacy-blocked add, subject
-// to the send rate limit, caches it like any other sent message, and records
-// the outcome in out. An invite the rate limit holds back leaves out as
-// invite_required: repeating the add later issues a fresh invite.
+// inviteParticipant sends and caches a group invitation, recording its outcome.
 func (c *Client) inviteParticipant(ctx context.Context, out *ParticipantOutcome, to, chat types.JID, groupName, caption string, req *types.GroupParticipantAddRequest) {
 	if req.Code == "" {
 		out.Error = "WhatsApp returned no invite code, so no invite was sent"
-		return
-	}
-	if err := c.checkSendRate(ctx, to); err != nil {
-		out.Error = fmt.Sprintf("invite not sent yet: %v; repeat the add for this participant after that to send it", err)
 		return
 	}
 	msg := buildGroupInviteMessage(chat, groupName, caption, req)

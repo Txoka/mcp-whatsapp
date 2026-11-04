@@ -26,6 +26,7 @@ var expectedToolNames = []string{
 	"join_group_with_link",
 	"leave_group",
 	"list_chats",
+	"list_unread_chats",
 	"list_groups",
 	"list_messages",
 	"mark_chat_read",
@@ -51,6 +52,7 @@ var expectedToolNames = []string{
 	"set_status_message",
 	"unblock_contact",
 	"update_group_participants",
+	"wait_for_updates",
 }
 
 func TestNewServer_RegistersAllTools(t *testing.T) {
@@ -116,7 +118,7 @@ func TestNewServer_RegistersAllTools(t *testing.T) {
 
 func TestNewServer_ToolCount(t *testing.T) {
 	s := NewServer(nil, nil)
-	const want = 42
+	const want = 44
 	if got := len(s.MCP().ListTools()); got != want {
 		t.Errorf("tool count = %d, want %d", got, want)
 	}
@@ -135,7 +137,8 @@ func TestToolsByDomain(t *testing.T) {
 
 	// domain file → representative tool name(s) that MUST be present.
 	domains := map[string][]string{
-		"tools_query.go":   {"list_chats", "search_contacts"},
+		"tools_query.go": {"list_chats",
+			"list_unread_chats", "search_contacts"},
 		"tools_send.go":    {"send_message", "send_file"},
 		"tools_message.go": {"edit_message", "mark_read"},
 		"tools_groups.go":  {"create_group", "leave_group"},

@@ -6,10 +6,13 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -36,6 +39,9 @@ func ChmodBestEffort(path string, mode os.FileMode) error {
 
 // Message mirrors the on-wire shape used by downstream consumers.
 type Message struct {
+	MentionJIDs []string  `json:"-"`
+	Mentions    []Mention `json:"mentions,omitempty"`
+	MentionsMe  bool      `json:"mentions_me,omitempty"`
 	ID          string    `json:"id"`
 	ChatJID     string    `json:"chat_jid"`
 	Sender      string    `json:"sender"`                 // bare phone/user part
@@ -85,6 +91,8 @@ type MessageContext struct {
 
 // Store handles the message cache and read-only access to whatsmeow's DB.
 type Store struct {
+	updateMu    sync.Mutex
+	updateWake  chan struct{}
 	db          *sql.DB
 	whatsmeowDB *sql.DB
 	dir         string
@@ -108,7 +116,7 @@ func Open(dir string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open messages db: %w", err)
 	}
-	if _, err := db.Exec(schema); err != nil {
+	if _, err := db.Exec(schema + updatesSchema + mentionsSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
@@ -159,8 +167,11 @@ func (s *Store) Close() error {
 // StoreChat upserts a chat row.
 func (s *Store) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := s.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
-		jid, name, lastMessageTime,
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+ ON CONFLICT(jid) DO UPDATE SET
+ name=COALESCE(NULLIF(excluded.name,''),chats.name),
+ last_message_time=CASE WHEN chats.last_message_time IS NULL OR excluded.last_message_time > chats.last_message_time THEN excluded.last_message_time ELSE chats.last_message_time END`,
+		jid, name, lastMessageTime.UTC(),
 	)
 	return err
 }
@@ -172,13 +183,28 @@ func (s *Store) StoreMessage(ctx context.Context, m Message, mediaKey, fileSHA25
 	if m.Content == "" && m.MediaType == "" {
 		return nil
 	}
+	if strings.HasSuffix(m.ChatJID, "@g.us") && (m.Sender == m.ChatJID || m.Sender == jidUser(m.ChatJID)) {
+		m.Sender = ""
+	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT OR REPLACE INTO messages
+		`INSERT INTO messages
 		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, direct_path, media_key, file_sha256, file_enc_sha256, file_length)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		m.ID, m.ChatJID, m.Sender, m.Content, m.Timestamp, m.IsFromMe,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id, chat_jid) DO UPDATE SET
+		 sender = COALESCE(NULLIF(excluded.sender, ''), messages.sender, ''),
+		 content = excluded.content, timestamp = excluded.timestamp,
+		 is_from_me = CASE WHEN excluded.sender = '' THEN messages.is_from_me ELSE excluded.is_from_me END,
+		 media_type = excluded.media_type, filename = excluded.filename, url = excluded.url,
+		 direct_path = excluded.direct_path, media_key = excluded.media_key,
+		 file_sha256 = excluded.file_sha256, file_enc_sha256 = excluded.file_enc_sha256,
+		 file_length = excluded.file_length`,
+		m.ID, m.ChatJID, m.Sender, m.Content, m.Timestamp.UTC(), m.IsFromMe,
 		m.MediaType, m.Filename, m.URL, m.DirectPath, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
+	if err == nil && len(m.MentionJIDs) > 0 {
+		raw, _ := json.Marshal(m.MentionJIDs)
+		_, err = s.db.ExecContext(ctx, "INSERT OR REPLACE INTO message_mentions(chat_jid,message_id,jids_json) VALUES(?,?,?)", m.ChatJID, m.ID, string(raw))
+	}
 	return err
 }
 
@@ -246,23 +272,6 @@ func (s *Store) GetMessageAtOrBefore(chatJID string, before time.Time) (id strin
 		ORDER BY timestamp DESC
 		LIMIT 1`, chatJID, before).Scan(&id, &ts, &isFromMe)
 	return
-}
-
-// HasInboundFrom reports whether the cache holds at least one message we
-// received (is_from_me = 0) in the given chat. It is the "have we ever heard
-// from this JID" signal the rate limiter uses to classify a send target as a
-// known contact (leash) versus cold outreach (stricter leash). A group JID is
-// always a known context and callers treat it as such without querying here.
-func (s *Store) HasInboundFrom(chatJID string) (bool, error) {
-	var exists int
-	err := s.db.QueryRow(
-		"SELECT EXISTS(SELECT 1 FROM messages WHERE chat_jid = ? AND is_from_me = 0 LIMIT 1)",
-		chatJID,
-	).Scan(&exists)
-	if err != nil {
-		return false, err
-	}
-	return exists == 1, nil
 }
 
 // FindChatName returns the name stored for a chat JID, empty if none.

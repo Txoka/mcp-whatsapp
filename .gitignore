@@ -5,3 +5,12 @@ bin/
 cover.out
 # Anchored: only the repo-root session/data dir, NOT internal/store/
 /store/
+
+# Local deployment state and private historical snapshots
+/deployment/
+/archive/
+/local-backups/
+
+# Machine-specific deployment settings and private handoff
+/.env
+/docs/PROJECT_HANDOFF.md

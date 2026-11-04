@@ -56,3 +56,34 @@ func (s *Store) searchContactNames(pattern string) map[string]string {
 	}
 	return out
 }
+
+// ContactNames keeps saved address-book and self-chosen push names separate.
+// Exact PN/LID aliases are accepted; no fuzzy phone-number matching is used.
+func (s *Store) ContactNames(jids ...string) (contact, profile string) {
+	if s.whatsmeowDB == nil {
+		return
+	}
+	seen := map[string]bool{}
+	for _, raw := range jids {
+		for _, jid := range []string{s.ResolveLIDToJID(raw), raw} {
+			if jid == "" || seen[jid] {
+				continue
+			}
+			seen[jid] = true
+			var full, first, push sql.NullString
+			if s.whatsmeowDB.QueryRow("SELECT full_name,first_name,push_name FROM whatsmeow_contacts WHERE their_jid=?", jid).Scan(&full, &first, &push) != nil {
+				continue
+			}
+			if contact == "" {
+				contact = full.String
+				if contact == "" {
+					contact = first.String
+				}
+			}
+			if profile == "" {
+				profile = push.String
+			}
+		}
+	}
+	return
+}

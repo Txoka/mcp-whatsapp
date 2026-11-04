@@ -81,7 +81,7 @@ func (s *Server) registerLeaveGroup() {
 
 func (s *Server) registerListGroups() {
 	tool := mcp.NewTool("list_groups",
-		mcp.WithDescription("List every WhatsApp group the paired user is currently a member of, fetched live from WhatsApp. Read-only; no side effects. Use get_group_info for detailed metadata about one specific group. Returns a JSON array of group-info objects (each with JID, subject, participants, settings, and so on)."),
+		mcp.WithDescription("List every WhatsApp group the paired user is currently a member of, fetched live from WhatsApp. Read-only; no side effects. Use get_group_info for detailed metadata about one specific group. Returns compact group summaries with chat_jid, name and participant_count; participants are fetched only through get_group_info."),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithIdempotentHintAnnotation(true),
@@ -97,12 +97,16 @@ func (s *Server) registerListGroups() {
 }
 
 type getGroupInfoArgs struct {
+	Limit   int    `json:"limit,omitempty"`
+	Page    int    `json:"page,omitempty"`
 	ChatJID string `json:"chat_jid"`
 }
 
 func (s *Server) registerGetGroupInfo() {
 	tool := mcp.NewTool("get_group_info",
-		mcp.WithDescription("Fetch live group metadata (subject, topic, participants with admin flags, announce/locked settings, invite config) for the given group JID. Read-only; no side effects. Use list_groups to discover which groups exist. Returns a JSON object describing the group."),
+		mcp.WithInteger("limit", mcp.Min(1), mcp.Max(100), mcp.DefaultNumber(50), mcp.Description("participants per page, default 50, maximum 100")),
+		mcp.WithInteger("page", mcp.Min(0), mcp.DefaultNumber(0), mcp.Description("zero-based participant page")),
+		mcp.WithDescription("Fetch a group name/topic and a page of participants. Each participant includes phone, saved contact_name, self-chosen synchronized profile_name, role and exact jid. Null means not available; anonymous_label is not a profile name. Do not infer identities from phone suffixes. Use has_more/page for larger groups. Read-only; no side effects."),
 		mcp.WithString("chat_jid", mcp.Required(), mcp.Description(jidDesc)),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
@@ -113,7 +117,7 @@ func (s *Server) registerGetGroupInfo() {
 		if r := requireNonEmpty("chat_jid", a.ChatJID); r != nil {
 			return r, nil
 		}
-		js, err := s.client.GetGroupInfoJSON(ctx, a.ChatJID)
+		js, err := s.client.GetGroupInfoJSON(ctx, a.ChatJID, a.Limit, a.Page)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -131,7 +135,7 @@ type updateGroupParticipantsArgs struct {
 
 func (s *Server) registerUpdateGroupParticipants() {
 	tool := mcp.NewTool("update_group_participants",
-		mcp.WithDescription("Add, remove, promote, or demote participants of a group after first checking that the paired user is a group admin (or, for `add`, that the group lets every member add) — if not, it fails and nothing changes. The group shows a system message for each change; people whose privacy settings block being added directly get a WhatsApp group-invite card in their 1:1 chat instead (unless `send_invite=false`) and join by tapping it; invites share the outbound rate limit (about one per 45–90 s), so in a batch the rest come back as `invite_required` with a retry hint — repeat the add for them later. Reversible by calling again with the inverse action (`add` ↔ `remove`, `promote` ↔ `demote`), though a sent invite cannot be recalled. Returns `{chat_jid, group_name, action, is_admin, results: [{input, jid, status, error_code?, error?, invite_message_id?, invite_expires_at?}]}` where status is one of added, removed, promoted, demoted, already_member, not_member, invite_sent, invite_required, invite_failed, failed."),
+		mcp.WithDescription("Add, remove, promote, or demote participants of a group after first checking that the paired user is a group admin (or, for `add`, that the group lets every member add) — if not, it fails and nothing changes. The group shows a system message for each change; people whose privacy settings block being added directly get a WhatsApp group-invite card in their 1:1 chat instead (unless `send_invite=false`) and join by tapping it; Reversible by calling again with the inverse action (`add` ↔ `remove`, `promote` ↔ `demote`), though a sent invite cannot be recalled. Returns `{chat_jid, group_name, action, is_admin, results: [{input, jid, status, error_code?, error?, invite_message_id?, invite_expires_at?}]}` where status is one of added, removed, promoted, demoted, already_member, not_member, invite_sent, invite_required, invite_failed, failed."),
 		mcp.WithString("chat_jid", mcp.Required(), mcp.Description("group JID as `<digits>-<timestamp>@g.us` or `<digits>@g.us` (use list_groups to find it)")),
 		mcp.WithArray("participants", mcp.Required(), mcp.Items(map[string]any{"type": "string"}), mcp.Description("people to change, as phone digits only (E.164 without `+`, no spaces) or individual JIDs (`<digits>@s.whatsapp.net` or `<digits>@lid`); each at most once")),
 		mcp.WithString("action", mcp.Required(), mcp.Enum("add", "remove", "promote", "demote"), mcp.Description("mutation to perform: `add`, `remove`, `promote` (to admin), or `demote` (from admin)")),

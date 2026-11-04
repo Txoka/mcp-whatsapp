@@ -8,3 +8,12 @@ cover.out
 *.log
 claude_desktop_config.json
 docs/superpowers
+
+# Local deployment state and private historical snapshots
+/deployment/
+/archive/
+/local-backups/
+
+# Machine-specific deployment settings and private handoff
+/.env
+/docs/PROJECT_HANDOFF.md

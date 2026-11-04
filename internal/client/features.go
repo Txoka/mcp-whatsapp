@@ -11,8 +11,6 @@ import (
 
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/types"
-
-	"github.com/sealjay/mcp-whatsapp/internal/ratelimit"
 )
 
 // MarkRead marks messageIDs as read for the given chat. senderJID is the
@@ -42,7 +40,10 @@ func (c *Client) MarkRead(ctx context.Context, chatJID string, messageIDs []stri
 		ids[i] = types.MessageID(id)
 	}
 
-	return c.wa.MarkRead(ctx, ids, time.Now(), chat, sender)
+	if err := c.wa.MarkRead(ctx, ids, time.Now(), chat, sender); err != nil {
+		return err
+	}
+	return c.store.ObserveReadIDs(ctx, c.store.ResolveLIDToJID(chatJID), messageIDs)
 }
 
 // MarkChatRead acks recent incoming messages in a chat so the phone stops
@@ -81,6 +82,9 @@ func (c *Client) MarkChatRead(ctx context.Context, chatJID string, limit int) (i
 		}
 		if err := c.wa.MarkRead(ctx, ids, time.Now(), chat, sender); err != nil {
 			return count, fmt.Errorf("mark read (sender=%s): %w", senderRaw, err)
+		}
+		if err := c.store.ObserveReadIDs(ctx, c.store.ResolveLIDToJID(chatJID), ids); err != nil {
+			return count, err
 		}
 		count += len(ids)
 	}
@@ -230,17 +234,6 @@ func (c *Client) IsOnWhatsApp(ctx context.Context, phones []string) (map[string]
 	}
 	if len(phones) == 0 {
 		return map[string]bool{}, nil
-	}
-
-	// usync burst guard — WhatsApp rate-limits contact-discovery (usync)
-	// harder than sends, and a parallel fanout that verifies each recipient
-	// trips it first. One IsOnWhatsApp call is one usync regardless of batch
-	// size. The operator override bypasses it, same as sends.
-	if c.limiter != nil && !ratelimit.BypassFromContext(ctx) {
-		if d := c.limiter.AllowUsync(); !d.Allowed {
-			return nil, fmt.Errorf("rate limited: %s — retry in %s (set the X-Rate-Limit-Override header to bypass)",
-				d.Reason, d.RetryAfter.Round(time.Second))
-		}
 	}
 
 	// WhatsApp expects a leading '+' on phone queries.

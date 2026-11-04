@@ -31,13 +31,36 @@ func (c *Client) StartEventHandler() {
 			c.handleHistorySync(v)
 		case *events.Connected:
 			c.log.Infof("Connected to WhatsApp")
+			if c.wa.Store.ID != nil {
+				if err := c.store.SetOwnIdentity(c.wa.Store.ID.ToNonAD().String(), c.wa.Store.LID.ToNonAD().String()); err != nil {
+					c.log.Warnf("Own identity storage failed: %v", err)
+				}
+			}
+			go c.refreshReadState()
 		case *events.LoggedOut:
 			c.log.Warnf("Device logged out, please scan QR code to log in again")
 		case *events.OfflineSyncPreview:
 			c.log.Infof("Offline sync starting - %d messages, %d receipts pending", v.Messages, v.Receipts)
 		case *events.OfflineSyncCompleted:
 			c.log.Infof("Offline sync completed - %d messages synced", v.Count)
+		case *events.MarkChatAsRead:
+			if v.Action != nil && v.Action.Read != nil {
+				chat := c.store.ResolveLIDToJID(v.JID.String())
+				ts := v.Action.GetMessageRange().GetLastMessageTimestamp()
+				through := time.Time{}
+				if ts > 0 {
+					through = time.Unix(ts, 0)
+				}
+				if err := c.store.ObserveChatRead(context.Background(), chat, v.Action.GetRead(), through, v.Timestamp); err != nil {
+					c.log.Warnf("Read-state storage failed: %v", err)
+				}
+			}
 		case *events.Receipt:
+			if v.Type == types.ReceiptTypeReadSelf {
+				if err := c.store.ObserveReadIDs(context.Background(), c.store.ResolveLIDToJID(v.Chat.String()), v.MessageIDs); err != nil {
+					c.log.Warnf("Read receipt storage failed: %v", err)
+				}
+			}
 			c.log.Debugf("Receipt for %d messages: %s", len(v.MessageIDs), v.Type)
 		case *events.UndecryptableMessage:
 			c.log.Warnf("Undecryptable message from %s", v.Info.Sender)
@@ -112,16 +135,17 @@ func (c *Client) normalizeIncomingMessage(
 
 	return normalizedMessage{
 		msg: store.Message{
-			ID:         msgID,
-			ChatJID:    chatJID,
-			Sender:     sender,
-			Content:    content,
-			Timestamp:  timestamp,
-			IsFromMe:   isFromMe,
-			MediaType:  mediaType,
-			Filename:   filename,
-			URL:        url,
-			DirectPath: directPath,
+			MentionJIDs: extractMentionJIDs(raw),
+			ID:          msgID,
+			ChatJID:     chatJID,
+			Sender:      sender,
+			Content:     content,
+			Timestamp:   timestamp,
+			IsFromMe:    isFromMe,
+			MediaType:   mediaType,
+			Filename:    filename,
+			URL:         url,
+			DirectPath:  directPath,
 		},
 		mediaKey:      mediaKey,
 		fileSHA256:    fileSHA256,
@@ -180,6 +204,7 @@ func (c *Client) handleMessage(msg *events.Message) {
 		return
 	}
 
+	wasCached := c.store.HasMessage(nm.chatJID, nm.msg.ID)
 	err := c.store.StoreMessage(context.Background(), nm.msg, nm.mediaKey, nm.fileSHA256, nm.fileEncSHA256, nm.fileLength)
 
 	if err == nil && len(pollOptions) > 0 {
@@ -193,6 +218,11 @@ func (c *Client) handleMessage(msg *events.Message) {
 		return
 	}
 
+	if !wasCached {
+		if err := c.store.ObserveIncoming(context.Background(), nm.msg); err != nil {
+			c.log.Warnf("Incoming-state storage failed: %v", err)
+		}
+	}
 	direction := "<-"
 	if msg.Info.IsFromMe {
 		direction = "->"
@@ -249,6 +279,14 @@ func (c *Client) handleHistorySync(historySync *events.HistorySync) {
 
 		name := c.GetChatName(jid, chatJID, conversation, "")
 
+		if conversation.UnreadCount != nil || conversation.MarkedAsUnread != nil {
+			if err := c.store.StoreChat(chatJID, name, time.Unix(0, 0)); err != nil {
+				c.log.Warnf("Chat metadata storage failed: %v", err)
+			}
+			if err := c.store.SeedUnread(chatJID, conversation.UnreadCount, conversation.GetMarkedAsUnread()); err != nil {
+				c.log.Warnf("Unread snapshot storage failed: %v", err)
+			}
+		}
 		messages := conversation.Messages
 		if len(messages) == 0 {
 			continue
@@ -275,27 +313,11 @@ func (c *Client) handleHistorySync(historySync *events.HistorySync) {
 			}
 			timestamp := time.Unix(int64(msgTS), 0)
 
-			// Determine sender and isFromMe from the message key.
-			var rawSenderJID, senderUser string
-			isFromMe := false
-			if msg.Message.Key != nil {
-				if msg.Message.Key.FromMe != nil {
-					isFromMe = *msg.Message.Key.FromMe
-				}
-				if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
-					rawSenderJID = *msg.Message.Key.Participant
-					senderUser = strings.Split(rawSenderJID, "@")[0]
-				} else if isFromMe {
-					rawSenderJID = ownID + "@s.whatsapp.net"
-					senderUser = ownID
-				} else {
-					rawSenderJID = jid.String()
-					senderUser = jid.User
-				}
-			} else {
-				rawSenderJID = jid.String()
-				senderUser = jid.User
-			}
+			// History can carry its participant on WebMessageInfo rather than the
+			// message key. A missing participant never identifies the group itself.
+			isFromMe := msg.Message.GetKey().GetFromMe()
+			rawSenderJID, senderUser := historySender(rawChatJID, ownID, isFromMe,
+				msg.Message.GetKey().GetParticipant(), msg.Message.GetParticipant())
 
 			msgID := ""
 			if msg.Message.Key != nil && msg.Message.Key.ID != nil {
@@ -341,6 +363,13 @@ func (c *Client) handleHistorySync(historySync *events.HistorySync) {
 // The conversation parameter is the typed whatsmeow Conversation from a
 // history-sync payload; pass nil for live messages.
 func (c *Client) GetChatName(jid types.JID, chatJID string, conversation *waHistorySync.Conversation, sender string) string {
+	// A conversation is identified by its peer, not the author of whichever
+	// message happened to create the row (which can be our own account).
+	if !strings.HasSuffix(chatJID, "@g.us") {
+		if name := c.store.ContactName(chatJID); name != "" {
+			return name
+		}
+	}
 	if existing := c.store.FindChatName(chatJID); existing != "" {
 		c.log.Infof("Using existing chat name for %s: %s", chatJID, existing)
 		return existing
@@ -390,9 +419,7 @@ func (c *Client) resolveChatNameFallback(ctx context.Context, jid types.JID, sen
 	if contact, err := c.wa.Store.Contacts.GetContact(ctx, jid); err == nil && contact.FullName != "" {
 		return contact.FullName
 	}
-	if sender != "" {
-		return sender
-	}
+	// An outgoing sender is us, not the peer. Never use it as the chat name.
 	return jid.User
 }
 
@@ -527,4 +554,53 @@ func (c *Client) handlePollVote(msg *events.Message, chatJID, voterJID string) {
 	}
 
 	c.log.Debugf("Recorded poll vote from %s on poll %s with %d selections", voterJID, pollID, len(selected))
+}
+
+// historySender resolves the two participant locations used by history sync.
+// Unknown group senders remain unknown instead of overwriting a known sender
+// with the group's identity.
+func historySender(chatJID, ownID string, fromMe bool, keyParticipant, infoParticipant string) (string, string) {
+	if fromMe {
+		if ownID == "" {
+			return "", ""
+		}
+		return ownID + "@s.whatsapp.net", ownID
+	}
+	participant := keyParticipant
+	if participant == "" || participant == chatJID {
+		participant = infoParticipant
+	}
+	if participant != "" && participant != chatJID {
+		return participant, strings.Split(participant, "@")[0]
+	}
+	if strings.HasSuffix(chatJID, "@g.us") {
+		return "", ""
+	}
+	return chatJID, strings.Split(chatJID, "@")[0]
+}
+
+// Read actual mention metadata, never infer mentions from arbitrary @numbers.
+func extractMentionJIDs(msg *waProto.Message) []string {
+	if msg == nil {
+		return nil
+	}
+	if x := msg.GetExtendedTextMessage(); x != nil {
+		return x.GetContextInfo().GetMentionedJID()
+	}
+	if x := msg.GetImageMessage(); x != nil {
+		return x.GetContextInfo().GetMentionedJID()
+	}
+	if x := msg.GetVideoMessage(); x != nil {
+		return x.GetContextInfo().GetMentionedJID()
+	}
+	if x := msg.GetDocumentMessage(); x != nil {
+		return x.GetContextInfo().GetMentionedJID()
+	}
+	if x := msg.GetAudioMessage(); x != nil {
+		return x.GetContextInfo().GetMentionedJID()
+	}
+	if x := msg.GetStickerMessage(); x != nil {
+		return x.GetContextInfo().GetMentionedJID()
+	}
+	return nil
 }
