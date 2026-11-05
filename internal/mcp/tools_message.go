@@ -3,24 +3,18 @@ package mcp
 import (
 	"context"
 	"fmt"
-	"strconv"
-	"strings"
-	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
-
-	"github.com/sealjay/mcp-whatsapp/internal/client"
 )
 
 // registerMessageTools wires message-mutation and history tools:
-// edit_message, delete_message, mark_read, mark_chat_read, request_sync,
+// edit_message, delete_message, mark_read, mark_chat_read,
 // download_media.
 func (s *Server) registerMessageTools() {
 	s.registerEditMessage()
 	s.registerDeleteMessage()
 	s.registerMarkRead()
 	s.registerMarkChatRead()
-	s.registerRequestSync()
 	s.registerDownloadMedia()
 }
 
@@ -57,11 +51,13 @@ type deleteMessageArgs struct {
 	ChatJID   string `json:"chat_jid"`
 	MessageID string `json:"message_id"`
 	SenderJID string `json:"sender_jid,omitempty"`
+	Scope     string `json:"scope"`
 }
 
 func (s *Server) registerDeleteMessage() {
 	tool := mcp.NewTool("delete_message",
-		mcp.WithDescription("Revoke (delete-for-everyone) a message; recipients see a `message was deleted` notice and the local cache row is marked revoked. Permanent — there is no undo, and the original body cannot be restored once revoked. You can only delete your own messages unless you are a group admin. Use edit_message instead when you only want to correct text. Returns the plain-text string `Message deleted` on success."),
+		mcp.WithString("scope", mcp.Required(), mcp.Enum("everyone", "me"), mcp.Description("everyone: revoke for all participants; me: delete only for your account")),
+		mcp.WithDescription("Delete a message with an explicit scope. everyone revokes it for all participants, subject to WhatsApp permissions and time limits; me removes it only from your account through linked-device synchronization. Both are destructive and require approval. For me, the message must be cached so its exact key and timestamp can be resolved. No automatic fallback between scopes."),
 		mcp.WithString("chat_jid", mcp.Required(), mcp.Description(jidDesc)),
 		mcp.WithString("message_id", mcp.Required(), mcp.Description("WhatsApp message ID of the message to revoke (use `message_id` from list_messages)")),
 		mcp.WithString("sender_jid", mcp.Description("JID of the original sender; required when deleting someone else's message as a group admin, leave empty when deleting your own ("+jidDesc+")")),
@@ -71,10 +67,16 @@ func (s *Server) registerDeleteMessage() {
 		mcp.WithOpenWorldHintAnnotation(true),
 	)
 	s.mcp.AddTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a deleteMessageArgs) (*mcp.CallToolResult, error) {
-		if err := s.client.DeleteMessage(ctx, a.ChatJID, a.MessageID, a.SenderJID); err != nil {
+		if a.Scope != "everyone" && a.Scope != "me" {
+			return mcp.NewToolResultError("scope: must explicitly be everyone or me"), nil
+		}
+		if err := s.client.DeleteMessage(ctx, a.ChatJID, a.MessageID, a.SenderJID, a.Scope); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		return mcp.NewToolResultText("Message deleted"), nil
+		if a.Scope == "me" {
+			return mcp.NewToolResultText("Delete-for-me submitted to WhatsApp; local cached message removed. Linked-device propagation is not independently verified."), nil
+		}
+		return mcp.NewToolResultText("Message deleted for everyone"), nil
 	}))
 }
 
@@ -134,97 +136,6 @@ func (s *Server) registerMarkChatRead() {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("Acked %d message(s) in %s", count, a.ChatJID)), nil
-	}))
-}
-
-// -- request_sync -----------------------------------------------------------
-
-// flexInt is an int that also accepts a JSON string, for clients that send
-// numeric arguments as strings (typically when working from a cached tool
-// schema that predates the parameter).
-type flexInt int
-
-func (f *flexInt) UnmarshalJSON(b []byte) error {
-	s := strings.TrimSpace(strings.Trim(string(b), `"`))
-	if s == "" || s == "null" {
-		*f = 0
-		return nil
-	}
-	v, err := strconv.Atoi(s)
-	if err != nil {
-		return fmt.Errorf("count: must be an integer, got %s", string(b))
-	}
-	*f = flexInt(v)
-	return nil
-}
-
-// flexBool is a bool that also accepts a JSON string ("true"/"false"), for
-// clients sending boolean arguments as strings from a cached tool schema.
-type flexBool bool
-
-func (f *flexBool) UnmarshalJSON(b []byte) error {
-	s := strings.TrimSpace(strings.Trim(string(b), `"`))
-	if s == "" || s == "null" {
-		return nil
-	}
-	v, err := strconv.ParseBool(s)
-	if err != nil {
-		return fmt.Errorf("use_lid: must be a boolean, got %s", string(b))
-	}
-	*f = flexBool(v)
-	return nil
-}
-
-type requestSyncArgs struct {
-	ChatJID       string    `json:"chat_jid,omitempty"`
-	FromTimestamp string    `json:"from_timestamp,omitempty"`
-	Anchor        string    `json:"anchor,omitempty"`
-	Count         flexInt   `json:"count,omitempty"`
-	UseLID        *flexBool `json:"use_lid,omitempty"`
-}
-
-func (s *Server) registerRequestSync() {
-	tool := mcp.NewTool("request_sync",
-		mcp.WithDescription("Ask WhatsApp servers to backfill historical messages for a chat into the local cache; messages arrive asynchronously and become queryable via list_messages once delivered. No effect on the chat itself or other users. The request is always anchored on a real cached message, because WhatsApp resolves the cursor by message key. Use `anchor: \"oldest\"` to extend history backwards, calling repeatedly to walk back `count` messages at a time; `anchor: \"newest\"` (the default) only fills gaps below the most recent message. Returns a plain-text confirmation describing what was requested. An empty result afterwards means the server served nothing for that cursor, typically because the history predates WhatsApp's retention for linked devices."),
-		mcp.WithString("chat_jid", mcp.Required(), mcp.Description(jidDesc)),
-		mcp.WithString("from_timestamp", mcp.Description("ISO-8601 UTC timestamp; anchors on the newest cached message at or before this time, falling back to the oldest cached message when nothing is cached that far back. Ignored when `anchor` is set")),
-		mcp.WithString("anchor", mcp.Description("which cached message to anchor on: `oldest` to extend history backwards, `newest` to fill recent gaps (default)"), mcp.Enum(client.AnchorNewest, client.AnchorOldest)),
-		mcp.WithNumber("count", mcp.DefaultNumber(client.DefaultSyncCount), mcp.Description("how many messages to request before the anchor (default 50)")),
-		mcp.WithBoolean("use_lid", mcp.DefaultBool(true), mcp.Description("resolve the chat to its LID form (default true). Messages predating WhatsApp's LID migration are keyed on the phone-number JID; set false when walking back past that boundary returns empty batches")),
-		mcp.WithReadOnlyHintAnnotation(false),
-		mcp.WithDestructiveHintAnnotation(false),
-		mcp.WithIdempotentHintAnnotation(true),
-		mcp.WithOpenWorldHintAnnotation(true),
-	)
-	s.mcp.AddTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a requestSyncArgs) (*mcp.CallToolResult, error) {
-		if a.ChatJID == "" {
-			return mcp.NewToolResultError("chat_jid: required"), nil
-		}
-		switch a.Anchor {
-		case "", client.AnchorNewest, client.AnchorOldest:
-		default:
-			return mcp.NewToolResultError(fmt.Sprintf("anchor: must be %q or %q", client.AnchorNewest, client.AnchorOldest)), nil
-		}
-		if a.Count < 0 {
-			return mcp.NewToolResultError("count: must not be negative"), nil
-		}
-		useLID := true
-		if a.UseLID != nil {
-			useLID = bool(*a.UseLID)
-		}
-		var ts time.Time
-		if a.FromTimestamp != "" {
-			t, err := parseTimestamp(a.FromTimestamp)
-			if err != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("invalid from_timestamp: %v", err)), nil
-			}
-			ts = t
-		}
-		msg, err := s.client.RequestHistorySync(ctx, a.ChatJID, ts, a.Anchor, int(a.Count), useLID)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		return mcp.NewToolResultText(msg), nil
 	}))
 }
 

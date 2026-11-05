@@ -9,7 +9,9 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -177,10 +179,16 @@ func (c *Client) EditMessage(ctx context.Context, chatJID, messageID, newBody st
 	return nil
 }
 
-// DeleteMessage revokes a message for everyone. senderJID is required only
+// DeleteMessage requires an explicit everyone or me scope. senderJID is required only
 // when revoking someone else's message as a group admin; for your own
 // messages pass "".
-func (c *Client) DeleteMessage(ctx context.Context, chatJID, messageID, senderJID string) error {
+func (c *Client) DeleteMessage(ctx context.Context, chatJID, messageID, senderJID, scope string) error {
+	if scope != "everyone" && scope != "me" {
+		return errors.New("scope must be everyone or me")
+	}
+	if scope == "me" {
+		return c.deleteMessageForMe(ctx, chatJID, messageID)
+	}
 	if !c.wa.IsConnected() {
 		return errors.New("not connected to WhatsApp")
 	}
@@ -268,4 +276,48 @@ func (c *Client) IsOnWhatsApp(ctx context.Context, phones []string) (map[string]
 		}
 	}
 	return result, nil
+}
+
+// deleteMessageForMe sends an account-state mutation, never a revoke.
+func (c *Client) deleteMessageForMe(ctx context.Context, chatJID, messageID string) error {
+	if !c.wa.IsConnected() {
+		return errors.New("not connected to WhatsApp")
+	}
+	chatJID = c.store.ResolveLIDToJID(chatJID)
+	cached, err := c.store.GetMessageContext(ctx, messageID, 0, 0, chatJID)
+	if err != nil {
+		return fmt.Errorf("resolve delete-for-me message: %w", err)
+	}
+	m := cached.Message
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		return err
+	}
+	sender := "0"
+	fromMe := "0"
+	if m.IsFromMe {
+		fromMe = "1"
+	} else if chat.Server == types.GroupServer {
+		sender = m.Sender
+		if !strings.Contains(sender, "@") {
+			sender += "@s.whatsapp.net"
+		}
+		if m.Sender == "" {
+			return errors.New("original group sender is unknown")
+		}
+	}
+	patch := deleteForMePatch(chat.String(), sender, messageID, fromMe, m.Timestamp)
+	if err = c.wa.SendAppState(ctx, patch); err != nil {
+		return fmt.Errorf("send delete-for-me: %w", err)
+	}
+	if err = c.store.DeleteForMe(ctx, chatJID, messageID); err != nil {
+		return fmt.Errorf("WhatsApp accepted deletion but local cleanup failed: %w", err)
+	}
+	return nil
+}
+func deleteForMePatch(chat, sender, id, fromMe string, ts time.Time) appstate.PatchInfo {
+	return appstate.PatchInfo{Type: appstate.WAPatchRegularHigh, Mutations: []appstate.MutationInfo{{
+		Index: []string{appstate.IndexDeleteMessageForMe, chat, id, fromMe, sender}, Version: 3,
+		Value: &waSyncAction.SyncActionValue{DeleteMessageForMeAction: &waSyncAction.DeleteMessageForMeAction{DeleteMedia: proto.Bool(false), MessageTimestamp: proto.Int64(ts.Unix())}},
+	}}}
 }

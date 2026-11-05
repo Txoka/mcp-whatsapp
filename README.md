@@ -21,7 +21,7 @@ This started as a fork of [lharries/whatsapp-mcp](https://github.com/lharries/wh
 - **LID resolution** — normalises `@lid` JIDs to real phone numbers for accurate contact matching.
 - **Sent-message storage** — outgoing messages are persisted locally so conversation history stays complete.
 - **Disappearing-message timers** — outgoing messages inherit the group chat's ephemeral timer automatically.
-- **Targeted history sync** — on-demand per-chat backfill via the `request_sync` tool.
+- **Targeted history sync** — automatic per-chat backfill while reading messages.
 - **Extended tool surface** — 42 tools (see below): reactions, replies, edits, revoke, mark-read, typing, is-on-whatsapp, full group admin, blocklist, polls (create + vote + tally), contact cards, view-once flag, presence, privacy settings, and the profile "About" text.
 - **Single-instance enforcement** — a `flock(2)` on `store/.lock` prevents two `serve` processes racing on the same SQLite files.
 
@@ -94,7 +94,7 @@ Paths outside the root, including symlinks that resolve outside it, are rejected
 
 ## Running the daemon
 
-Events reach SQLite **only while `serve` runs**. After downtime, whatsmeow backfills via `HistorySync` within WhatsApp's own retention window; anything older is lost, and `request_sync` backfills one chat on demand. A `flock(2)` on `store/.lock` allows one `serve` (or `login`) per store.
+Events reach SQLite **only while `serve` runs**. After downtime, whatsmeow backfills via `HistorySync` within WhatsApp's own retention window; anything older is lost, and selected-chat reads attempt automatic backfill. A `flock(2)` on `store/.lock` allows one `serve` (or `login`) per store.
 
 | Option | How |
 |---|---|
@@ -144,7 +144,6 @@ Data lives under `./store/` (`-store DIR`): `messages.db` (message cache), `what
 | `get_chat` | Chat metadata by JID |
 | `get_message_context` | Before/after window around a specific message |
 | `download_media` | Download persisted media to a local path |
-| `request_sync` | Ask WhatsApp to backfill history for a chat |
 
 ### Send
 
@@ -167,7 +166,7 @@ Data lives under `./store/` (`-store DIR`): `messages.db` (message cache), `what
 | `send_reaction` | React to a message (empty emoji clears an existing reaction) |
 | `send_reply` | Text reply that quotes a prior message |
 | `edit_message` | Edit a previously-sent message |
-| `delete_message` | Revoke (delete for everyone) a message |
+| `delete_message` | Delete with required scope: `everyone` (revoke) or `me` (account-state deletion) |
 | `send_typing` | Set per-chat composing / recording presence |
 
 ### Groups
@@ -255,7 +254,7 @@ This bumps `go.mau.fi/whatsmeow@main`, re-tidies, builds, and tests. If green, c
 - **`another whatsapp-mcp instance is already running`** — only one `serve` can hold the store lock. Check for a stray process (`ps aux | grep whatsapp-mcp`) or another MCP client pointed at the same `-store` directory.
 - **QR doesn't display** — the terminal doesn't render half-block Unicode. Try iTerm2, Windows Terminal, or similar.
 - **Device limit reached** — WhatsApp caps linked devices. Remove one from *Settings → Linked Devices* on your phone.
-- **No messages loading** — after initial auth, it can take several minutes for history to backfill. Use `request_sync` to target a specific chat.
+- **No messages loading** — after initial auth, it can take several minutes for history to backfill. Read a selected chat to trigger automatic history backfill.
 - **WhatsApp out of sync** — delete both database files (`store/messages.db` and `store/whatsapp.db`) and re-run `login`.
 - **`ffmpeg not found`** — `send_audio_message` needs ffmpeg on `PATH` to convert non-Opus audio. Use `send_file` for raw audio instead.
 

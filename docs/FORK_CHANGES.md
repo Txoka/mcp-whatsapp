@@ -17,3 +17,19 @@ Based on upstream commit `078ac8c5e3f8a6f32c6a5902e4859f86c853330f`.
 ## Validation
 
 The complete Go test suite passed after the code changes. Store/MCP race tests passed for concurrent event waiting and retrieval. Live checks used cached reads, group metadata and bounded waits; no chat messages or read receipts were sent as tests. This validation does not establish complete synchronization of every WhatsApp state or every possible history variant.
+
+## Explicit deletion scopes and automatic history
+
+Message listing retains automatic selected-chat history backfill. The manual
+`request_sync` tool is removed from the agent catalog.
+
+`delete_message` requires `scope: everyone` or `scope: me`, with no default.
+Both scopes require approval. Everyone uses WhatsApp revocation; me sends a
+version-3 regular-high account-state deletion mutation and removes the cached
+message after acceptance. It requires the exact cached message timestamp and
+ownership. Incoming linked-device DeleteForMe events apply the same cleanup.
+Durable chat/message tombstones prevent history replay from restoring deleted
+messages. Cached attachment files are retained (`deleteMedia=false`).
+
+Validation uses isolated tests; no real messages are deleted as tests. Successful
+submission does not prove that every linked client has applied the deletion.

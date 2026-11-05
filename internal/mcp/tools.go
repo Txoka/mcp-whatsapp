@@ -5,7 +5,7 @@ package mcp
 // Tool registrations are split by domain:
 //   - tools_query.go   — read-only data retrieval (list_chats, search_contacts, …)
 //   - tools_send.go    — outbound messages (send_message, send_file, send_reaction, …)
-//   - tools_message.go — message mutation & history (edit, delete, mark_read, sync, …)
+//   - tools_message.go — message mutation & history (edit, delete, mark_read, …)
 //   - tools_groups.go  — group management (create, leave, participants, settings, …)
 //   - tools_media.go   — polls + contact cards
 //   - tools_privacy.go — blocklist, presence, privacy settings, status message

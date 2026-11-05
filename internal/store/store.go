@@ -186,7 +186,7 @@ func (s *Store) StoreMessage(ctx context.Context, m Message, mediaKey, fileSHA25
 	if strings.HasSuffix(m.ChatJID, "@g.us") && (m.Sender == m.ChatJID || m.Sender == jidUser(m.ChatJID)) {
 		m.Sender = ""
 	}
-	_, err := s.db.ExecContext(ctx,
+	result, err := s.db.ExecContext(ctx,
 		`INSERT INTO messages
 		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, direct_path, media_key, file_sha256, file_enc_sha256, file_length)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -201,6 +201,11 @@ func (s *Store) StoreMessage(ctx context.Context, m Message, mediaKey, fileSHA25
 		m.ID, m.ChatJID, m.Sender, m.Content, m.Timestamp.UTC(), m.IsFromMe,
 		m.MediaType, m.Filename, m.URL, m.DirectPath, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
+	if err == nil {
+		if n, e := result.RowsAffected(); e == nil && n == 0 {
+			return nil
+		}
+	}
 	if err == nil && len(m.MentionJIDs) > 0 {
 		raw, _ := json.Marshal(m.MentionJIDs)
 		_, err = s.db.ExecContext(ctx, "INSERT OR REPLACE INTO message_mentions(chat_jid,message_id,jids_json) VALUES(?,?,?)", m.ChatJID, m.ID, string(raw))
@@ -337,6 +342,12 @@ CREATE TABLE IF NOT EXISTS messages (
 	FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 );
 
+CREATE TABLE IF NOT EXISTS deleted_messages (
+ chat_jid TEXT NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY(chat_jid,message_id)
+);
+CREATE TRIGGER IF NOT EXISTS prevent_deleted_message_reimport BEFORE INSERT ON messages
+WHEN EXISTS (SELECT 1 FROM deleted_messages WHERE chat_jid=NEW.chat_jid AND message_id=NEW.id)
+BEGIN SELECT RAISE(IGNORE); END;
 CREATE TABLE IF NOT EXISTS poll_votes (
 	poll_message_id TEXT NOT NULL,
 	poll_chat_jid TEXT NOT NULL,

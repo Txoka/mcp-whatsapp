@@ -27,6 +27,10 @@ func (c *Client) StartEventHandler() {
 		switch v := evt.(type) {
 		case *events.Message:
 			c.handleMessage(v)
+		case *events.DeleteForMe:
+			if err := c.store.DeleteForMe(context.Background(), c.store.ResolveLIDToJID(v.ChatJID.String()), v.MessageID); err != nil {
+				c.log.Warnf("Delete-for-me storage failed: %v", err)
+			}
 		case *events.HistorySync:
 			c.handleHistorySync(v)
 		case *events.Connected:
