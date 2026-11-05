@@ -479,17 +479,12 @@ func (c *Client) inviteParticipant(ctx context.Context, out *ParticipantOutcome,
 		return
 	}
 	msg := buildGroupInviteMessage(chat, groupName, caption, req)
-	resp, err := c.wa.SendMessage(ctx, to, msg)
+	resp, err := c.sendTracked(ctx, to, msg)
 	if err != nil {
 		out.Status = statusInviteFailed
 		out.Error = fmt.Sprintf("send group invite: %v", err)
 		return
 	}
-	summary := "Group invite: " + groupName
-	if caption != "" {
-		summary += " — " + caption
-	}
-	c.persistSent(ctx, to, resp.ID, summary, "", msg)
 	out.Status = statusInviteSent
 	out.InviteMessageID = resp.ID
 }

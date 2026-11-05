@@ -39,3 +39,10 @@ python3 ops/probe.py
 For OpenCode, adapt `ops/opencode-whatsapp.example.json` with your absolute credential-file path. Configure approval for outgoing messages, read receipts and other mutations in the client. MCP annotations do not themselves enforce human approval; the local configuration used to develop this fork permits read-only tools and asks for writes.
 
 Before replacing a running deployment, stop it and take a consistent copy of its store. Do not run two clients against the same session database. Local recovery snapshots and historical scripts are intentionally not published.
+
+## Consistency and diagnostics
+
+See [architecture](ARCHITECTURE.md) for the read/write contract and operator settings.
+Inspect local state with `python3 ops/inspect_state.py`. This command does not show
+message bodies, credentials or session keys. An unresolved operation is not permission
+to repeat it. Refresh the MCP client's tool definitions after updating the service.

@@ -20,7 +20,7 @@ def rpc(method: str, params=None):
             "Accept": "application/json, text/event-stream",
         },
     )
-    with urllib.request.urlopen(request, timeout=10) as response:
+    with urllib.request.urlopen(request, timeout=135) as response:
         body = response.read().decode()
     if not body.lstrip().startswith("{"):
         body = next(line[6:] for line in body.splitlines() if line.startswith("data: "))
@@ -45,7 +45,7 @@ def check() -> None:
 
     for name, arguments in (
         ("list_chats", {"limit": 1, "include_last_message": False}),
-        ("list_messages", {"limit": 1, "auto_sync": False}),
+        ("list_messages", {"limit": 1}),
     ):
         result = rpc("tools/call", {"name": name, "arguments": arguments})
         if result.get("error") or result.get("result", {}).get("isError"):

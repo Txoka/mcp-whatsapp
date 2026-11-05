@@ -6,7 +6,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -39,20 +38,21 @@ func ChmodBestEffort(path string, mode os.FileMode) error {
 
 // Message mirrors the on-wire shape used by downstream consumers.
 type Message struct {
-	MentionJIDs []string  `json:"-"`
-	Mentions    []Mention `json:"mentions,omitempty"`
-	MentionsMe  bool      `json:"mentions_me,omitempty"`
-	ID          string    `json:"id"`
-	ChatJID     string    `json:"chat_jid"`
-	Sender      string    `json:"sender"`                 // bare phone/user part
-	SenderPhone string    `json:"sender_phone,omitempty"` // full phone if resolvable
-	Content     string    `json:"content"`
-	Timestamp   time.Time `json:"timestamp"`
-	IsFromMe    bool      `json:"is_from_me"`
-	IsGroup     bool      `json:"is_group"`
-	MediaType   string    `json:"media_type,omitempty"`
-	Filename    string    `json:"filename,omitempty"`
-	URL         string    `json:"url,omitempty"`
+	ContentStatus string    `json:"content_status,omitempty"`
+	MentionJIDs   []string  `json:"-"`
+	Mentions      []Mention `json:"mentions,omitempty"`
+	MentionsMe    bool      `json:"mentions_me,omitempty"`
+	ID            string    `json:"id"`
+	ChatJID       string    `json:"chat_jid"`
+	Sender        string    `json:"sender"`                 // canonical JID; older cache rows may contain bare user IDs
+	SenderPhone   string    `json:"sender_phone,omitempty"` // full phone if resolvable
+	Content       string    `json:"content"`
+	Timestamp     time.Time `json:"timestamp"`
+	IsFromMe      bool      `json:"is_from_me"`
+	IsGroup       bool      `json:"is_group"`
+	MediaType     string    `json:"media_type,omitempty"`
+	Filename      string    `json:"filename,omitempty"`
+	URL           string    `json:"url,omitempty"`
 	// DirectPath is the CDN path (starting with `/`, including the signed
 	// `?ccb=&oh=&oe=&_nc_sid=` auth query) captured verbatim from the
 	// WhatsApp media protobuf at receive/send time. When present, the
@@ -91,6 +91,7 @@ type MessageContext struct {
 
 // Store handles the message cache and read-only access to whatsmeow's DB.
 type Store struct {
+	writeMu     sync.Mutex
 	updateMu    sync.Mutex
 	updateWake  chan struct{}
 	db          *sql.DB
@@ -116,7 +117,7 @@ func Open(dir string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open messages db: %w", err)
 	}
-	if _, err := db.Exec(schema + updatesSchema + mentionsSchema); err != nil {
+	if _, err := db.Exec(schema + updatesSchema + mentionsSchema + projectionSchema + synchronizationSchema + inboxSchema + outboxSchema + bookmarkSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
@@ -180,36 +181,10 @@ func (s *Store) StoreChat(jid, name string, lastMessageTime time.Time) error {
 // no media type are dropped to avoid polluting the cache with signal-only
 // events (typing, receipts, key exchange, etc.).
 func (s *Store) StoreMessage(ctx context.Context, m Message, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
-	if m.Content == "" && m.MediaType == "" {
-		return nil
-	}
 	if strings.HasSuffix(m.ChatJID, "@g.us") && (m.Sender == m.ChatJID || m.Sender == jidUser(m.ChatJID)) {
 		m.Sender = ""
 	}
-	result, err := s.db.ExecContext(ctx,
-		`INSERT INTO messages
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, direct_path, media_key, file_sha256, file_enc_sha256, file_length)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id, chat_jid) DO UPDATE SET
-		 sender = COALESCE(NULLIF(excluded.sender, ''), messages.sender, ''),
-		 content = excluded.content, timestamp = excluded.timestamp,
-		 is_from_me = CASE WHEN excluded.sender = '' THEN messages.is_from_me ELSE excluded.is_from_me END,
-		 media_type = excluded.media_type, filename = excluded.filename, url = excluded.url,
-		 direct_path = excluded.direct_path, media_key = excluded.media_key,
-		 file_sha256 = excluded.file_sha256, file_enc_sha256 = excluded.file_enc_sha256,
-		 file_length = excluded.file_length`,
-		m.ID, m.ChatJID, m.Sender, m.Content, m.Timestamp.UTC(), m.IsFromMe,
-		m.MediaType, m.Filename, m.URL, m.DirectPath, mediaKey, fileSHA256, fileEncSHA256, fileLength,
-	)
-	if err == nil {
-		if n, e := result.RowsAffected(); e == nil && n == 0 {
-			return nil
-		}
-	}
-	if err == nil && len(m.MentionJIDs) > 0 {
-		raw, _ := json.Marshal(m.MentionJIDs)
-		_, err = s.db.ExecContext(ctx, "INSERT OR REPLACE INTO message_mentions(chat_jid,message_id,jids_json) VALUES(?,?,?)", m.ChatJID, m.ID, string(raw))
-	}
+	_, err := s.ApplyMessages(ctx, []MessageEvent{{Message: m, MediaKey: mediaKey, FileSHA256: fileSHA256, FileEncSHA256: fileEncSHA256, FileLength: fileLength}})
 	return err
 }
 

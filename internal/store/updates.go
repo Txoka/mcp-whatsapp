@@ -2,8 +2,13 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -40,17 +45,29 @@ type UnreadChat struct {
 	Status        string `json:"count_status"`
 }
 type UnreadOverview struct {
+	NextPage     *int         `json:"next_page,omitempty"`
 	HasMore      bool         `json:"has_more"`
 	Chats        []UnreadChat `json:"chats"`
 	UnknownChats int          `json:"chats_without_complete_counts"`
 	Note         string       `json:"note"`
 }
 
-func (s *Store) UnreadChats(ctx context.Context, chat string, limit int) (UnreadOverview, error) {
-	if limit <= 0 || limit > 100 {
+func (s *Store) UnreadChats(ctx context.Context, chat string, limit int, pages ...int) (UnreadOverview, error) {
+	if limit == 0 {
 		limit = 100
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT c.jid,c.name,r.unread_count,COALESCE(r.marked_unread,0),
+	if limit < 1 {
+		return UnreadOverview{}, fmt.Errorf("limit must be positive")
+	}
+	page := 0
+	if len(pages) > 0 {
+		page = pages[0]
+	}
+	if page < 0 || page > int(^uint(0)>>1)/limit {
+		return UnreadOverview{}, fmt.Errorf("invalid unread page")
+	}
+	offset, seen := page*limit, 0
+	rows, err := s.reader(ctx).QueryContext(ctx, `SELECT c.jid,c.name,r.unread_count,COALESCE(r.marked_unread,0),
  (SELECT count(*) FROM messages WHERE messages.chat_jid=c.jid AND `+knownUnreadSQL+`)
  FROM chats c LEFT JOIN chat_read_state r ON r.chat_jid=c.jid WHERE (?='' OR c.jid=?) ORDER BY c.last_message_time DESC,c.jid`, chat, chat)
 	if err != nil {
@@ -73,10 +90,16 @@ func (s *Store) UnreadChats(ctx context.Context, chat string, limit int) (Unread
 			result.UnknownChats++
 		}
 		if count.Int64 > 0 || item.KnownMessages > 0 || item.MarkedUnread {
+			seen++
+			if seen <= offset {
+				continue
+			}
 			if len(result.Chats) < limit {
 				result.Chats = append(result.Chats, item)
 			} else {
 				result.HasMore = true
+				next := page + 1
+				result.NextPage = &next
 			}
 		}
 	}
@@ -101,6 +124,8 @@ func (s *Store) SeedUnread(chat string, count *uint32, marked bool) error {
 	return err
 }
 func (s *Store) ObserveIncoming(ctx context.Context, m Message) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if m.IsFromMe {
 		return nil
 	}
@@ -109,13 +134,26 @@ func (s *Store) ObserveIncoming(ctx context.Context, m Message) error {
 		return err
 	}
 	defer tx.Rollback()
+	if err = observeIncomingTx(ctx, tx, m); err != nil {
+		return err
+	}
+	return s.commitUpdate(tx)
+}
+func observeIncomingTx(ctx context.Context, tx *sql.Tx, m Message) error {
+	var present bool
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM deleted_messages WHERE chat_jid=? AND message_id=?)", m.ChatJID, m.ID).Scan(&present); err != nil {
+		return err
+	}
+	if present {
+		return nil
+	}
 	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO local_updates(kind,chat_jid,message_id,created_at) VALUES('message',?,?,?)`, m.ChatJID, m.ID, time.Now().UnixMilli())
 	if err != nil {
 		return err
 	}
 	changed, _ := result.RowsAffected()
 	if changed == 0 {
-		return s.commitUpdate(tx)
+		return nil
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO message_read_state(chat_jid,message_id,unread)
  VALUES(?,?,NOT EXISTS(SELECT 1 FROM chat_read_state WHERE chat_jid=? AND read_through>=?))
@@ -128,25 +166,34 @@ func (s *Store) ObserveIncoming(ctx context.Context, m Message) error {
 	if err != nil {
 		return err
 	}
-	return s.commitUpdate(tx)
+	return nil
 }
+
+type readChatEvent struct {
+	Read            bool
+	Through, Action time.Time
+}
+
 func (s *Store) ObserveChatRead(ctx context.Context, chat string, read bool, through, action time.Time) error {
 	if action.IsZero() {
-		if through.IsZero() {
-			return fmt.Errorf("read marker has no timestamp")
-		}
 		action = through
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	if action.IsZero() {
+		return fmt.Errorf("read marker has no timestamp")
+	}
+	raw, err := json.Marshal(readChatEvent{read, through, action})
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO chats(jid,name,last_message_time) VALUES(?,'',?)", chat, time.Unix(0, 0).UTC()); err != nil {
+	_, err = s.ApplyMessages(ctx, []MessageEvent{{Kind: "read_chat", Message: Message{ChatJID: chat, ID: fmt.Sprintf("read:%d:%t", action.UnixMilli(), read), Content: string(raw)}}})
+	return err
+}
+func observeChatReadTx(ctx context.Context, tx *sql.Tx, chat string, read bool, through, action time.Time) error {
+	if _, err := tx.ExecContext(ctx, "INSERT OR IGNORE INTO chats(jid,name,last_message_time) VALUES(?,'',?)", chat, time.Unix(0, 0).UTC()); err != nil {
 		return err
 	}
 	var previous int64
-	err = tx.QueryRowContext(ctx, "SELECT action_time FROM chat_read_state WHERE chat_jid=?", chat).Scan(&previous)
+	err := tx.QueryRowContext(ctx, "SELECT action_time FROM chat_read_state WHERE chat_jid=?", chat).Scan(&previous)
 	if err != nil && err != sql.ErrNoRows {
 		return err
 	}
@@ -173,14 +220,21 @@ func (s *Store) ObserveChatRead(ctx context.Context, chat string, read bool, thr
 	if err != nil {
 		return err
 	}
-	return s.commitUpdate(tx)
+	return nil
 }
 func (s *Store) ObserveReadIDs(ctx context.Context, chat string, ids []string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	ids = append([]string(nil), ids...)
+	sort.Strings(ids)
+	ids = slices.Compact(ids)
+	raw, err := json.Marshal(ids)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	_, err = s.ApplyMessages(ctx, []MessageEvent{{Kind: "read_ids", Message: Message{ChatJID: chat, ID: fmt.Sprintf("read:%x", sha256.Sum256(raw)), Content: string(raw)}}})
+	return err
+}
+func observeReadIDsTx(ctx context.Context, tx *sql.Tx, chat string, ids []string) error {
+	var err error
 	for _, id := range ids {
 		_, err = tx.ExecContext(ctx, `INSERT INTO message_read_state(chat_jid,message_id,unread) VALUES(?,?,0) ON CONFLICT(chat_jid,message_id) DO UPDATE SET unread=0`, chat, id)
 		if err != nil {
@@ -197,7 +251,7 @@ func (s *Store) ObserveReadIDs(ctx context.Context, chat string, ids []string) e
 	if err != nil {
 		return err
 	}
-	return s.commitUpdate(tx)
+	return nil
 }
 
 type LocalUpdate struct {
@@ -222,7 +276,7 @@ type WaitResult struct {
 func (s *Store) updateHead(ctx context.Context) (string, int64, error) {
 	var epoch string
 	var seq int64
-	err := s.db.QueryRowContext(ctx, `SELECT value,(SELECT COALESCE(MAX(seq),0) FROM local_updates) FROM local_metadata WHERE key='updates_epoch'`).Scan(&epoch, &seq)
+	err := s.reader(ctx).QueryRowContext(ctx, `SELECT value,COALESCE((SELECT seq FROM sqlite_sequence WHERE name='local_updates'),0) FROM local_metadata WHERE key='updates_epoch'`).Scan(&epoch, &seq)
 	return epoch, seq, err
 }
 
@@ -238,6 +292,9 @@ func (s *Store) updateSignal() <-chan struct{} {
 	return s.updateWake
 }
 func (s *Store) commitUpdate(tx *sql.Tx) error {
+	if _, err := tx.Exec("UPDATE projection_clock SET version=version+1 WHERE id=1"); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
@@ -278,50 +335,22 @@ func (s *Store) WaitUpdates(ctx context.Context, chat, kind, cursor string, time
 	result := WaitResult{Status: "timeout", Updates: []LocalUpdate{}}
 	for {
 		wake := s.updateSignal()
-		_, head, err = s.updateHead(ctx)
+		var consumed int64
+		var more bool
+		result.Updates, consumed, more, err = s.readUpdateSnapshot(ctx, after, chat, kind)
 		if err != nil {
 			return result, err
 		}
-		rows, err := s.db.QueryContext(ctx, `SELECT seq,kind,chat_jid,message_id FROM local_updates WHERE seq>? AND seq<=? AND (?='' OR chat_jid=?) AND (?='any' OR kind=?) ORDER BY seq LIMIT 100`, after, head, chat, chat, kind, kind)
-		if err != nil {
-			return result, err
-		}
-		for rows.Next() {
-			var u LocalUpdate
-			if err = rows.Scan(&u.Seq, &u.Kind, &u.ChatJID, &u.MessageID); err != nil {
-				rows.Close()
-				return result, err
-			}
-			result.Updates = append(result.Updates, u)
-		}
-		err = rows.Err()
-		rows.Close()
-		if err != nil {
-			return result, err
-		}
+		result.Cursor = fmt.Sprintf("%s.%d", epoch, consumed)
 		if len(result.Updates) > 0 {
-			last := result.Updates[len(result.Updates)-1].Seq
-			for i := range result.Updates {
-				u := &result.Updates[i]
-				u.Chat = s.ChatDisplayName(u.ChatJID, s.FindChatName(u.ChatJID))
-				if u.Kind == "message" {
-					message, e := s.GetMessageContext(ctx, u.MessageID, 0, 0, u.ChatJID)
-					if e == nil {
-						u.Author = s.GetSenderName(ctx, message.Message.Sender)
-						u.Time = message.Message.Timestamp.In(time.Local).Format("2006-01-02 15:04 MST")
-						u.Text, u.Mentions, u.MentionsMe = s.RenderMentions(ctx, message.Message, false)
-						if message.Message.MediaType != "" {
-							u.Text = "[" + message.Message.MediaType + "] " + u.Text
-						}
-					}
-				}
-			}
 			result.Status = "updates"
-			result.Cursor = fmt.Sprintf("%s.%d", epoch, last)
 			return result, nil
 		}
-		after = head
-		result.Cursor = fmt.Sprintf("%s.%d", epoch, after)
+		after = consumed
+		if more {
+			continue
+		}
+
 		select {
 		case <-waitCtx.Done():
 			if ctx.Err() != nil {
@@ -331,4 +360,62 @@ func (s *Store) WaitUpdates(ctx context.Context, chat, kind, cursor string, time
 		case <-wake:
 		}
 	}
+}
+
+// Read notification references and their bodies from the same committed state.
+func (s *Store) readUpdateSnapshot(ctx context.Context, after int64, chat, kind string) ([]LocalUpdate, int64, bool, error) {
+	var updates []LocalUpdate
+	consumed := after
+	more := false
+	_, err := s.ReadSnapshot(ctx, func(ctx context.Context) error {
+		_, head, err := s.updateHead(ctx)
+		if err != nil {
+			return err
+		}
+		rows, err := s.reader(ctx).QueryContext(ctx, `SELECT seq,kind,chat_jid,message_id FROM local_updates WHERE seq>? AND seq<=? AND (?='' OR chat_jid=?) AND (?='any' OR kind=?) ORDER BY seq LIMIT 100`, after, head, chat, chat, kind, kind)
+		if err != nil {
+			return err
+		}
+		var references []LocalUpdate
+		for rows.Next() {
+			var u LocalUpdate
+			if err = rows.Scan(&u.Seq, &u.Kind, &u.ChatJID, &u.MessageID); err != nil {
+				rows.Close()
+				return err
+			}
+			references = append(references, u)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return err
+		}
+		more = len(references) == 100
+		consumed = head
+		if more {
+			consumed = references[len(references)-1].Seq
+		}
+		for _, u := range references {
+			name := s.chatNameByJID(ctx, u.ChatJID)
+			u.Chat = s.ChatDisplayName(u.ChatJID, name)
+			if u.Kind == "message" {
+				message, err := s.GetMessageContext(ctx, u.MessageID, 0, 0, u.ChatJID)
+				if errors.Is(err, sql.ErrNoRows) {
+					continue
+				}
+				if err != nil {
+					return err
+				}
+				u.Author = s.GetSenderName(ctx, message.Message.Sender)
+				u.Time = message.Message.Timestamp.In(time.Local).Format("2006-01-02 15:04 MST")
+				u.Text, u.Mentions, u.MentionsMe = s.RenderMentions(ctx, message.Message, false)
+				if message.Message.MediaType != "" {
+					u.Text = "[" + message.Message.MediaType + "] " + u.Text
+				}
+			}
+			updates = append(updates, u)
+		}
+		return nil
+	})
+	return updates, consumed, more, err
 }

@@ -26,7 +26,7 @@ func (s *Store) RenderMentions(ctx context.Context, m Message, detailed bool) (s
 	jids := m.MentionJIDs
 	if len(jids) == 0 {
 		var raw string
-		if s.db.QueryRowContext(ctx, "SELECT jids_json FROM message_mentions WHERE chat_jid=? AND message_id=?", m.ChatJID, m.ID).Scan(&raw) == nil {
+		if s.reader(ctx).QueryRowContext(ctx, "SELECT jids_json FROM message_mentions WHERE chat_jid=? AND message_id=?", m.ChatJID, m.ID).Scan(&raw) == nil {
 			json.Unmarshal([]byte(raw), &jids)
 		}
 	}
@@ -35,7 +35,7 @@ func (s *Store) RenderMentions(ctx context.Context, m Message, detailed bool) (s
 	}
 	var ownRaw string
 	var own []string
-	if s.db.QueryRowContext(ctx, "SELECT value FROM local_metadata WHERE key='own_mention_identity'").Scan(&ownRaw) == nil {
+	if s.reader(ctx).QueryRowContext(ctx, "SELECT value FROM local_metadata WHERE key='own_mention_identity'").Scan(&ownRaw) == nil {
 		json.Unmarshal([]byte(ownRaw), &own)
 	}
 	ownSet := map[string]bool{}

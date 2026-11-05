@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"time"
 
@@ -24,28 +25,46 @@ func (c *Client) StartEventHandler() {
 		return
 	}
 	c.handlerID = c.wa.AddEventHandler(func(evt interface{}) {
+		switch evt.(type) {
+		case *events.Message, *events.DeleteForMe, *events.MarkChatAsRead, *events.Receipt:
+			finish := c.syncState.processing()
+			defer finish(nil)
+		}
+
 		switch v := evt.(type) {
 		case *events.Message:
 			c.handleMessage(v)
 		case *events.DeleteForMe:
 			if err := c.store.DeleteForMe(context.Background(), c.store.ResolveLIDToJID(v.ChatJID.String()), v.MessageID); err != nil {
+				c.syncState.recordFailure(err)
 				c.log.Warnf("Delete-for-me storage failed: %v", err)
 			}
 		case *events.HistorySync:
 			c.handleHistorySync(v)
+		case *events.AppStateSyncError:
+			c.syncState.collectionFailure(string(v.Name), v.Error)
+		case *events.AppStateSyncComplete:
+			c.syncState.collectionComplete(string(v.Name))
+		case *events.Disconnected:
+			c.syncState.connection(false)
 		case *events.Connected:
+			c.syncState.connection(false)
 			c.log.Infof("Connected to WhatsApp")
 			if c.wa.Store.ID != nil {
 				if err := c.store.SetOwnIdentity(c.wa.Store.ID.ToNonAD().String(), c.wa.Store.LID.ToNonAD().String()); err != nil {
 					c.log.Warnf("Own identity storage failed: %v", err)
 				}
 			}
-			go c.refreshReadState()
+			finish := c.syncState.processing()
+			go func() { defer finish(nil); c.refreshReadState() }()
 		case *events.LoggedOut:
+			c.syncState.connection(false)
 			c.log.Warnf("Device logged out, please scan QR code to log in again")
 		case *events.OfflineSyncPreview:
+			c.syncState.connection(false)
 			c.log.Infof("Offline sync starting - %d messages, %d receipts pending", v.Messages, v.Receipts)
 		case *events.OfflineSyncCompleted:
+			c.syncState.connection(true)
 			c.log.Infof("Offline sync completed - %d messages synced", v.Count)
 		case *events.MarkChatAsRead:
 			if v.Action != nil && v.Action.Read != nil {
@@ -56,12 +75,14 @@ func (c *Client) StartEventHandler() {
 					through = time.Unix(ts, 0)
 				}
 				if err := c.store.ObserveChatRead(context.Background(), chat, v.Action.GetRead(), through, v.Timestamp); err != nil {
+					c.syncState.recordFailure(err)
 					c.log.Warnf("Read-state storage failed: %v", err)
 				}
 			}
 		case *events.Receipt:
 			if v.Type == types.ReceiptTypeReadSelf {
 				if err := c.store.ObserveReadIDs(context.Background(), c.store.ResolveLIDToJID(v.Chat.String()), v.MessageIDs); err != nil {
+					c.syncState.recordFailure(err)
 					c.log.Warnf("Read receipt storage failed: %v", err)
 				}
 			}
@@ -121,21 +142,21 @@ func (c *Client) normalizeIncomingMessage(
 		}
 	}
 
-	// Normalise sender (may be in LID form inside groups).
-	sender := senderUser
+	// Preserve the identity namespace. A LID is not a phone number.
 	normalizedSender := c.store.ResolveLIDToJID(rawSenderJID)
-	if normalizedSender != rawSenderJID {
-		sender = strings.Split(normalizedSender, "@")[0]
-		c.log.Infof("Normalized sender: %s -> %s", c.redactor.JID(senderUser), c.redactor.JID(sender))
-	}
-
-	// If the message is from us and we have no better sender, use ownID.
+	sender := normalizedSender
 	if isFromMe && sender == "" && ownID != "" {
-		sender = ownID
+		sender = ownID + "@s.whatsapp.net"
 	}
 
 	content := extractTextContent(raw)
+	if poll := pollCreation(raw); poll != nil {
+		content = poll.GetName()
+	}
 	mediaType, filename, url, directPath, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(raw)
+	if pollCreation(raw) != nil {
+		mediaType = "poll"
+	}
 
 	return normalizedMessage{
 		msg: store.Message{
@@ -162,6 +183,16 @@ func (c *Client) normalizeIncomingMessage(
 
 // handleMessage persists an incoming message and its chat metadata.
 func (c *Client) handleMessage(msg *events.Message) {
+	if event, mutation, err := c.protocolMutation(msg.Info.Chat.String(), msg.Message); mutation {
+		if err == nil {
+			_, err = c.store.ApplyMessages(context.Background(), []store.MessageEvent{event})
+		}
+		if err != nil {
+			c.syncState.recordFailure(err)
+			c.log.Warnf("Message mutation failed: %v", err)
+		}
+		return
+	}
 	nm := c.normalizeIncomingMessage(
 		msg.Info.Chat.String(),
 		msg.Info.Sender.String(),
@@ -175,10 +206,6 @@ func (c *Client) handleMessage(msg *events.Message) {
 	)
 
 	name := c.GetChatName(msg.Info.Chat, nm.chatJID, nil, nm.msg.Sender)
-
-	if err := c.store.StoreChat(nm.chatJID, name, msg.Info.Timestamp); err != nil {
-		c.log.Warnf("Failed to store chat: %v", err)
-	}
 
 	// Poll vote — a signal-only event with no user-visible content. Decrypt,
 	// tally into the local cache, and return. We pass the post-LID-resolution
@@ -196,10 +223,11 @@ func (c *Client) handleMessage(msg *events.Message) {
 	// cache the option names so we can decode vote SHA-256 hashes later.
 	var pollOptions []string
 	if msg.Message != nil {
-		if pc := msg.Message.GetPollCreationMessage(); pc != nil {
+		if pc := pollCreation(msg.Message); pc != nil {
 			pollOptions = extractPollOptionNames(pc)
 			if nm.msg.Content == "" {
-				nm.msg.Content = "[poll] " + pc.GetName()
+				nm.msg.Content = pc.GetName()
+				nm.msg.MediaType = "poll"
 			}
 		}
 	}
@@ -208,24 +236,11 @@ func (c *Client) handleMessage(msg *events.Message) {
 		return
 	}
 
-	wasCached := c.store.HasMessage(nm.chatJID, nm.msg.ID)
-	err := c.store.StoreMessage(context.Background(), nm.msg, nm.mediaKey, nm.fileSHA256, nm.fileEncSHA256, nm.fileLength)
-
-	if err == nil && len(pollOptions) > 0 {
-		if perr := c.store.StorePollMetadata(context.Background(), msg.Info.ID, nm.chatJID, pollOptions); perr != nil {
-			c.log.Warnf("Failed to store poll metadata for %s: %v", msg.Info.ID, perr)
-		}
-	}
-
+	_, err := c.store.ApplyMessages(context.Background(), []store.MessageEvent{{Message: nm.msg, ChatName: name, LegacySender: msg.Info.Sender.User, ContentUnknown: !contentKnown(msg.Message), Incoming: true, PollOptions: pollOptions, MediaKey: nm.mediaKey, FileSHA256: nm.fileSHA256, FileEncSHA256: nm.fileEncSHA256, FileLength: nm.fileLength}})
 	if err != nil {
-		c.log.Warnf("Failed to store message: %v", err)
+		c.syncState.recordFailure(err)
+		c.log.Warnf("Failed to apply message event: %v", err)
 		return
-	}
-
-	if !wasCached {
-		if err := c.store.ObserveIncoming(context.Background(), nm.msg); err != nil {
-			c.log.Warnf("Incoming-state storage failed: %v", err)
-		}
 	}
 	direction := "<-"
 	if msg.Info.IsFromMe {
@@ -241,6 +256,14 @@ func (c *Client) handleMessage(msg *events.Message) {
 
 // handleHistorySync processes a bulk history payload from WhatsApp.
 func (c *Client) handleHistorySync(historySync *events.HistorySync) {
+	finish := c.syncState.processing()
+	var importErr error
+	defer func() { c.completeHistory(historySync, importErr); finish(importErr) }()
+	if historySync == nil || historySync.Data == nil {
+		importErr = fmt.Errorf("invalid history payload")
+		return
+	}
+
 	syncType := "UNKNOWN"
 	if historySync.Data.SyncType != nil {
 		syncType = historySync.Data.SyncType.String()
@@ -249,7 +272,8 @@ func (c *Client) handleHistorySync(historySync *events.HistorySync) {
 		syncType, len(historySync.Data.Conversations))
 
 	ctx := context.Background()
-	syncedCount := 0
+	var projected []store.MessageEvent
+	var chatSnapshots []store.ChatSnapshot
 
 	ownID := ""
 	if c.wa.Store.ID != nil {
@@ -283,34 +307,26 @@ func (c *Client) handleHistorySync(historySync *events.HistorySync) {
 
 		name := c.GetChatName(jid, chatJID, conversation, "")
 
-		if conversation.UnreadCount != nil || conversation.MarkedAsUnread != nil {
-			if err := c.store.StoreChat(chatJID, name, time.Unix(0, 0)); err != nil {
-				c.log.Warnf("Chat metadata storage failed: %v", err)
-			}
-			if err := c.store.SeedUnread(chatJID, conversation.UnreadCount, conversation.GetMarkedAsUnread()); err != nil {
-				c.log.Warnf("Unread snapshot storage failed: %v", err)
-			}
-		}
+		chatSnapshots = append(chatSnapshots, store.ChatSnapshot{JID: chatJID, Name: name, LastMessageTime: time.Unix(int64(conversation.GetLastMsgTimestamp()), 0), UnreadCount: conversation.UnreadCount, MarkedUnread: conversation.MarkedAsUnread})
 		messages := conversation.Messages
 		if len(messages) == 0 {
 			continue
 		}
-
-		latestMsg := messages[0]
-		if latestMsg == nil || latestMsg.Message == nil {
-			continue
-		}
-		ts := latestMsg.Message.GetMessageTimestamp()
-		if ts == 0 {
-			continue
-		}
-		_ = c.store.StoreChat(chatJID, name, time.Unix(int64(ts), 0))
 
 		for _, msg := range messages {
 			if msg == nil || msg.Message == nil {
 				continue
 			}
 
+			raw := unwrapHistoryMessage(msg.Message.Message)
+			if event, mutation, err := c.protocolMutation(rawChatJID, raw); mutation {
+				if err != nil {
+					importErr = err
+					return
+				}
+				projected = append(projected, event)
+				continue
+			}
 			msgTS := msg.Message.GetMessageTimestamp()
 			if msgTS == 0 {
 				continue
@@ -331,7 +347,7 @@ func (c *Client) handleHistorySync(historySync *events.HistorySync) {
 			nm := c.normalizeIncomingMessage(
 				rawChatJID, rawSenderJID, senderUser,
 				isGroup, isFromMe, ownID,
-				msgID, timestamp, msg.Message.Message,
+				msgID, timestamp, raw,
 			)
 
 			c.log.Infof("Message content: %s, Media Type: %s", c.redactor.Body(nm.msg.Content), nm.msg.MediaType)
@@ -343,22 +359,18 @@ func (c *Client) handleHistorySync(historySync *events.HistorySync) {
 			// conversation header — avoids re-resolving per message.
 			nm.msg.ChatJID = chatJID
 
-			if err := c.store.StoreMessage(ctx, nm.msg, nm.mediaKey, nm.fileSHA256, nm.fileEncSHA256, nm.fileLength); err != nil {
-				c.log.Warnf("Failed to store history message: %v", err)
-				continue
-			}
-			syncedCount++
-			if nm.msg.MediaType != "" {
-				c.log.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
-					timestamp.Format("2006-01-02 15:04:05"), c.redactor.JID(nm.msg.Sender), c.redactor.JID(chatJID), nm.msg.MediaType, nm.msg.Filename, c.redactor.Body(nm.msg.Content))
-			} else {
-				c.log.Infof("Stored message: [%s] %s -> %s: %s",
-					timestamp.Format("2006-01-02 15:04:05"), c.redactor.JID(nm.msg.Sender), c.redactor.JID(chatJID), c.redactor.Body(nm.msg.Content))
-			}
+			projected = append(projected, store.MessageEvent{Message: nm.msg, ChatName: name, LegacySender: senderUser, ContentUnknown: !contentKnown(raw), PollOptions: extractPollOptionNames(pollCreation(raw)), MediaKey: nm.mediaKey, FileSHA256: nm.fileSHA256, FileEncSHA256: nm.fileEncSHA256, FileLength: nm.fileLength})
+
 		}
 	}
 
-	c.log.Infof("History sync complete. Stored %d messages.", syncedCount)
+	result, err := c.store.ApplyHistory(ctx, projected, chatSnapshots)
+	if err != nil {
+		importErr = err
+		c.log.Warnf("History transaction failed: %v", err)
+		return
+	}
+	c.log.Infof("History sync committed: %d inserted, %d suppressed, watermark %d", result.Inserted, result.Suppressed, result.Watermark)
 }
 
 // GetChatName determines the appropriate name for a chat. It checks the
@@ -411,7 +423,7 @@ func (c *Client) GetChatName(jid types.JID, chatJID string, conversation *waHist
 // resolveChatNameFallback looks up a chat's name via GetGroupInfo (for
 // groups) or the contact store (for DMs), falling back to sender (if given)
 // and finally jid.User. This is the shared tail of GetChatName's group and
-// contact branches, also used directly by persistSent (which has no
+// contact branches, also used by outgoing projection (which has no
 // conversation metadata to check first).
 func (c *Client) resolveChatNameFallback(ctx context.Context, jid types.JID, sender string) string {
 	if jid.Server == "g.us" {
@@ -437,6 +449,15 @@ func extractTextContent(msg *waProto.Message) string {
 	}
 	if ext := msg.GetExtendedTextMessage(); ext != nil {
 		return ext.GetText()
+	}
+	if image := msg.GetImageMessage(); image != nil {
+		return image.GetCaption()
+	}
+	if video := msg.GetVideoMessage(); video != nil {
+		return video.GetCaption()
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		return doc.GetCaption()
 	}
 	return ""
 }
@@ -545,12 +566,9 @@ func (c *Client) handlePollVote(msg *events.Message, chatJID, voterJID string) {
 		}
 	}
 
-	// Clamp the peer-supplied timestamp to now so a malicious far-future value
-	// can't permanently suppress later legitimate updates via the replay guard.
+	// Use the server envelope's event time. Never rewrite it using the local
+	// wall clock or trust a peer-supplied future time as a newer revision.
 	ts := msg.Info.Timestamp
-	if now := time.Now(); ts.After(now) {
-		ts = now
-	}
 
 	if err := c.store.StorePollVote(ctx, pollID, chatJID, voterJID, selected, ts); err != nil {
 		c.log.Warnf("Failed to store poll vote for poll %s in %s: %v", pollID, chatJID, err)

@@ -19,11 +19,13 @@ import (
 
 // DownloadResult is the public return value from Download.
 type DownloadResult struct {
-	Success   bool
-	Message   string
-	MediaType string
-	Filename  string
-	Path      string
+	Success       bool
+	Message       string
+	MediaType     string
+	Filename      string
+	Path          string
+	Caption       string `json:"caption,omitempty"`
+	CaptionStatus string `json:"caption_status,omitempty"`
 }
 
 // MediaDownloader implements whatsmeow.DownloadableMessage for cached media.
@@ -52,7 +54,34 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 // decrypted bytes are additionally placed at that location (validated against
 // the configured media root). The cache is always populated so subsequent
 // calls remain idempotent.
-func (c *Client) Download(ctx context.Context, messageID, chatJID, outputPath string) DownloadResult {
+func (c *Client) Download(ctx context.Context, messageID, chatJID, outputPath string) (result DownloadResult) {
+	defer func() {
+		if !result.Success {
+			return
+		}
+		result.CaptionStatus = "unknown"
+		metadata, err := c.store.GetMessageContext(ctx, messageID, 0, 0, chatJID)
+		if err != nil {
+			return
+		}
+		if metadata.Message.ContentStatus == "unknown" && c.wa != nil && c.wa.IsConnected() {
+			repairCtx, cancel := context.WithTimeout(ctx, c.ReadPolicy().Timeout)
+			defer cancel()
+			anchor, anchorErr := c.store.CaptionRepairAnchor(repairCtx, chatJID, metadata.Message.Timestamp)
+			if anchorErr == nil {
+				_, _ = c.fetchHistoryAt(repairCtx, chatJID, true, &anchor)
+				metadata, err = c.store.GetMessageContext(repairCtx, messageID, 0, 0, chatJID)
+			}
+		}
+		if err != nil || metadata == nil {
+			return
+		}
+		result.CaptionStatus = metadata.Message.ContentStatus
+		if result.CaptionStatus == "known" {
+			result.Caption = metadata.Message.Content
+		}
+	}()
+
 	// Validate output_path first so a bad path fails the call before any DB
 	// or network work. The skip-if-exists check waits until after we have
 	// the media metadata (so the success response carries the right fields).

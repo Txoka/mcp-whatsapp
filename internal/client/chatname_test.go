@@ -155,7 +155,7 @@ func TestHandleMessage_LIDNormalization(t *testing.T) {
 	if storedChat != resolvedJID {
 		t.Errorf("chat_jid = %q, want %q (LID should have been normalized)", storedChat, resolvedJID)
 	}
-	if sender != "447700000002" {
+	if sender != "447700000002@s.whatsapp.net" {
 		t.Errorf("sender = %q, want \"447700000002\" (LID should have been normalized)", sender)
 	}
 	if content != "hello from lid" {
@@ -250,7 +250,7 @@ func TestHandleMessage_GroupChatNotNormalized(t *testing.T) {
 	if storedChat != groupJID {
 		t.Errorf("chat_jid = %q, want %q (group jid should NOT be normalized)", storedChat, groupJID)
 	}
-	if storedSender != "447700000002" {
+	if storedSender != "447700000002@s.whatsapp.net" {
 		t.Errorf("sender = %q, want normalized phone", storedSender)
 	}
 }

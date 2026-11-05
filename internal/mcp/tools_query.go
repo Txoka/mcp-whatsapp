@@ -3,7 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
-	"os"
+	"strconv"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -35,19 +35,21 @@ type searchContactsArgs struct {
 
 func (s *Server) registerSearchContacts() {
 	tool := mcp.NewTool("search_contacts",
-		mcp.WithDescription(offlineSafePrefix+"Search the cached WhatsApp contact list by case-insensitive substring of name or phone number. Read-only; no side effects. Use is_on_whatsapp to verify whether an unknown phone number is registered. Returns a JSON array of contact objects (each with JID, push name, full name, and phone)."),
+		mcp.WithDescription(snapshotReadPrefix+"Search the cached WhatsApp contact list by case-insensitive substring of name or phone number. Read-only; no side effects. Use is_on_whatsapp to verify whether an unknown phone number is registered. Returns up to 50 indexed contact matches; narrow the query if needed. Returns a JSON array of contact objects (each with JID, push name, full name, and phone)."),
 		mcp.WithString("query", mcp.Required(), mcp.Description("case-insensitive substring to match against name or phone")),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithIdempotentHintAnnotation(true),
 		mcp.WithOpenWorldHintAnnotation(false),
 	)
-	s.mcp.AddTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a searchContactsArgs) (*mcp.CallToolResult, error) {
-		contacts, err := s.client.Store().SearchContacts(ctx, a.Query)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		return resultJSON(contacts)
+	s.registerTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a searchContactsArgs) (*mcp.CallToolResult, error) {
+		return s.cachedRead(ctx, func(ctx context.Context) (*mcp.CallToolResult, error) {
+			contacts, err := s.client.Store().SearchContacts(ctx, a.Query)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return snapshotResult(contacts)
+		}, "", "contacts")
 	}))
 }
 
@@ -56,7 +58,6 @@ func (s *Server) registerSearchContacts() {
 type listMessagesArgs struct {
 	UnreadOnly        bool   `json:"unread_only,omitempty"`
 	Cursor            string `json:"cursor,omitempty"`
-	AutoSync          *bool  `json:"auto_sync,omitempty"`
 	Format            string `json:"format,omitempty"`
 	Timezone          string `json:"timezone,omitempty"`
 	After             string `json:"after,omitempty"`
@@ -74,17 +75,16 @@ type listMessagesArgs struct {
 func (s *Server) registerListMessages() {
 	tool := mcp.NewTool("list_messages",
 		mcp.WithBoolean("unread_only", mcp.DefaultBool(false), mcp.Description("only incoming messages with known unread identities/read watermarks; phone counts may include messages not identified in cache")),
-		mcp.WithString("cursor", mcp.Description("Opaque next-page cursor returned by a previous query; reuse the same filters")),
-		mcp.WithBoolean("auto_sync", mcp.DefaultBool(true), mcp.Description("automatically try to load missing older history for a selected chat; false for strictly cache-only diagnostics")),
+		mcp.WithString("cursor", mcp.Description("Short next-page bookmark returned by this tool; copy unchanged with the same filters; omit page")),
 		mcp.WithString("format", mcp.Enum("compact", "detailed"), mcp.DefaultString("compact"), mcp.Description("compact: readable messages without transport IDs (default); detailed: exact message/chat IDs needed for replies, reactions, downloads or diagnostics")),
 		mcp.WithString("timezone", mcp.Description("IANA timezone for compact timestamps, e.g. Europe/Madrid; defaults to server TZ, otherwise UTC")),
-		mcp.WithDescription("Read WhatsApp messages with automatic bounded history loading for a selected chat. Returns compact local-time messages and an opaque next-page cursor when available. An incomplete cache is reported explicitly; never interpret it as an empty conversation. Does not send chat messages or mark anything read. Use detailed format only when exact transport IDs are needed."),
+		mcp.WithDescription("Read WhatsApp messages after local catch-up and automatic history loading for a selected chat. Required history fetches wait for a correlated completed response; timeout or unconfirmed completion returns an error without partial messages. Returns compact local-time messages and an opaque next-page cursor when available. Results describe a local snapshot with explicitly limited coverage, not an authoritative current view of the phone; never interpret an incomplete cache as an empty conversation. Does not send chat messages or mark anything read. Use detailed format only when exact transport IDs are needed."),
 		mcp.WithString("after", mcp.Description("ISO-8601 lower bound on message timestamp (exclusive; include timezone)")),
 		mcp.WithString("before", mcp.Description("ISO-8601 upper bound on message timestamp (exclusive; include timezone)")),
 		mcp.WithString("sender_phone_number", mcp.Description("filter to messages sent by this phone or JID ("+jidDesc+")")),
 		mcp.WithString("chat_jid", mcp.Description("filter to messages in this chat ("+jidDesc+")")),
 		mcp.WithString("query", mcp.Description("case-insensitive substring to match within message body")),
-		mcp.WithNumber("limit", mcp.DefaultNumber(20), mcp.Description("max messages to return (default 20, capped at 100 server-side)")),
+		mcp.WithNumber("limit", mcp.DefaultNumber(float64(min(20, s.client.ReadPolicy().MaxPage))), mcp.Description("max messages to return (default 20, subject to the configured page resource budget)")),
 		mcp.WithNumber("page", mcp.DefaultNumber(0), mcp.Description("legacy zero-based page index; prefer the returned next-page cursor")),
 		mcp.WithBoolean("include_context", mcp.DefaultBool(false), mcp.Description("if true, add surrounding messages to search matches; overlapping windows are deduplicated. Defaults to false for normal chat history")),
 		mcp.WithNumber("context_before", mcp.DefaultNumber(1), mcp.Description("messages to include before each match (default 1, capped at 20 server-side)")),
@@ -94,13 +94,23 @@ func (s *Server) registerListMessages() {
 		mcp.WithIdempotentHintAnnotation(true),
 		mcp.WithOpenWorldHintAnnotation(true),
 	)
-	s.mcp.AddTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a listMessagesArgs) (*mcp.CallToolResult, error) {
+	s.registerTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a listMessagesArgs) (*mcp.CallToolResult, error) {
+		if s.client != nil {
+			chat, err := s.readChatReference(a.ChatJID)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			a.ChatJID = chat
+		}
+
+		ctx, cancel := context.WithTimeout(ctx, s.client.ReadPolicy().Timeout)
+		defer cancel()
 		if a.Format != "" && a.Format != "compact" && a.Format != "detailed" {
 			return mcp.NewToolResultError("format must be compact or detailed"), nil
 		}
 		timezone := a.Timezone
 		if timezone == "" {
-			timezone = os.Getenv("TZ")
+			timezone = s.client.ReadPolicy().Timezone
 		}
 		if timezone == "" {
 			timezone = "UTC"
@@ -108,18 +118,21 @@ func (s *Server) registerListMessages() {
 		if _, err := time.LoadLocation(timezone); err != nil {
 			return mcp.NewToolResultError("timezone: unknown IANA timezone"), nil
 		}
-		// Clamp parameters to server-side upper bounds.
+		// Resource budgets are explicit and independent of WhatsApp quotas.
 		limit := a.Limit
-		if limit > 100 {
-			limit = 100
+		if limit == 0 {
+			limit = min(20, s.client.ReadPolicy().MaxPage)
+		}
+		if limit > s.client.ReadPolicy().MaxPage || limit < 0 {
+			return mcp.NewToolResultError("limit exceeds the configured page budget; use pagination"), nil
 		}
 		ctxBefore := a.ContextBefore
 		if ctxBefore > 20 {
-			ctxBefore = 20
+			return mcp.NewToolResultError("context_before exceeds the context budget of 20"), nil
 		}
 		ctxAfter := a.ContextAfter
 		if ctxAfter > 20 {
-			ctxAfter = 20
+			return mcp.NewToolResultError("context_after exceeds the context budget of 20"), nil
 		}
 		params := store.ListMessagesParams{
 			UnreadOnly:     a.UnreadOnly,
@@ -146,29 +159,65 @@ func (s *Server) registerListMessages() {
 			}
 			params.Before = t
 		}
-		if err := applyCursor(&params, a.Cursor); err != nil {
+		rawCursor, resolveErr := s.client.Store().ResolveBookmark(ctx, "p", filterKey(params), a.Cursor)
+		if resolveErr != nil {
+			return mcp.NewToolResultError(resolveErr.Error()), nil
+		}
+		if err := applyCursor(&params, rawCursor); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		auto := a.AutoSync == nil || *a.AutoSync
-		msgs, status, cursor, err := s.history.read(ctx, s.client, params, auto)
+		msgs, status, cursor, err := s.history.read(ctx, s.client, params)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
+		domain := "messages"
 		if a.UnreadOnly {
-			overview, overviewErr := s.client.Store().UnreadChats(ctx, a.ChatJID, 100)
-			if overviewErr != nil {
-				return mcp.NewToolResultError(overviewErr.Error()), nil
+			domain = "unread"
+		}
+		result, readErr := s.cachedRead(ctx, func(ctx context.Context) (*mcp.CallToolResult, error) {
+			base := params
+			base.IncludeContext = false
+			msgs, err = s.client.Store().ListMessages(ctx, base)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
 			}
-			status = overview.Note
+			cursor = nextCursor(params, msgs)
+			if params.IncludeContext {
+				msgs, err = s.client.Store().ListMessages(ctx, params)
+				if err != nil {
+					return mcp.NewToolResultError(err.Error()), nil
+				}
+			}
+			if a.UnreadOnly {
+				overview, overviewErr := s.client.Store().UnreadChats(ctx, a.ChatJID, 100)
+				if overviewErr != nil {
+					return mcp.NewToolResultError(overviewErr.Error()), nil
+				}
+				status += " " + overview.Note
+			}
+			if a.Format == "detailed" {
+				text, err := s.client.Store().FormatMessagesDetailed(ctx, msgs, true, timezone)
+				if err != nil {
+					return mcp.NewToolResultError(err.Error()), nil
+				}
+				return mcp.NewToolResultText(readingFooter(text, status, "")), nil
+			}
+			text, err := s.client.Store().FormatMessagesCompact(ctx, msgs, timezone)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(readingFooter(text, status, "")), nil
+		}, a.ChatJID, domain)
+		if readErr != nil || result == nil || result.IsError || cursor == "" {
+			return result, readErr
 		}
-		if a.Format == "detailed" {
-			return mcp.NewToolResultText(readingFooter(s.client.Store().FormatMessagesList(ctx, msgs, true), status, cursor)), nil
-		}
-		text, err := s.client.Store().FormatMessagesCompact(ctx, msgs, timezone)
+		bookmark, err := s.client.Store().PutBookmark(ctx, "p", filterKey(params), cursor)
 		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return mcp.NewToolResultError("cursor: could not persist continuation; retry this read"), nil
 		}
-		return mcp.NewToolResultText(readingFooter(text, status, cursor)), nil
+		result.Content = append(result.Content, mcp.NewTextContent("Next page: cursor="+strconv.Quote(bookmark)+" (reuse the same filters; do not increment page)."))
+		return s.checkResponseBudget(result)
+
 	}))
 }
 
@@ -184,9 +233,9 @@ type listChatsArgs struct {
 
 func (s *Server) registerListChats() {
 	tool := mcp.NewTool("list_chats",
-		mcp.WithDescription(offlineSafePrefix+"List cached WhatsApp chats (1:1 and group), optionally filtered by name substring and sorted by recency or alphabetic name. Read-only; no side effects. Use get_chat for a single chat by JID, list_groups for groups only. Returns a JSON array of chat objects (each with JID, name, last-message metadata when requested)."),
+		mcp.WithDescription(snapshotReadPrefix+"List cached WhatsApp chats (1:1 and group), optionally filtered by name substring and sorted by recency or alphabetic name. Read-only; no side effects. Use get_chat for a single chat by JID, list_groups for groups only. Returns a JSON array of chat objects (each with JID, name, last-message metadata when requested)."),
 		mcp.WithString("query", mcp.Description("case-insensitive substring to match against chat name")),
-		mcp.WithNumber("limit", mcp.DefaultNumber(20), mcp.Description("max chats to return (default 20)")),
+		mcp.WithNumber("limit", mcp.DefaultNumber(float64(min(20, s.client.ReadPolicy().MaxPage))), mcp.Description("max chats to return (default 20)")),
 		mcp.WithNumber("page", mcp.DefaultNumber(0), mcp.Description("zero-based page index for paging through results (default 0)")),
 		mcp.WithBoolean("include_last_message", mcp.DefaultBool(true), mcp.Description("if true, include each chat's most recent message in the result (defaults to true)")),
 		mcp.WithString("sort_by", mcp.DefaultString("last_active"), mcp.Enum("last_active", "name"), mcp.Description("sort order: `last_active` (most-recent first, default) or `name` (alphabetic)")),
@@ -195,17 +244,32 @@ func (s *Server) registerListChats() {
 		mcp.WithIdempotentHintAnnotation(true),
 		mcp.WithOpenWorldHintAnnotation(false),
 	)
-	s.mcp.AddTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a listChatsArgs) (*mcp.CallToolResult, error) {
-		sortBy := a.SortBy
-		if sortBy == "" {
-			sortBy = "last_active"
-		}
-		include := a.IncludeLastMessage == nil || *a.IncludeLastMessage
-		chats, err := s.client.Store().ListChats(ctx, a.Query, a.Limit, a.Page, include, sortBy)
+	s.registerTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a listChatsArgs) (*mcp.CallToolResult, error) {
+		limit, err := s.pageBudget(a.Limit, a.Page, 20)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		return resultJSON(chats)
+		a.Limit = limit
+
+		return s.cachedRead(ctx, func(ctx context.Context) (*mcp.CallToolResult, error) {
+			sortBy := a.SortBy
+			if sortBy == "" {
+				sortBy = "last_active"
+			}
+			if sortBy != "last_active" && sortBy != "name" {
+				return mcp.NewToolResultError("sort_by must be last_active or name"), nil
+			}
+			include := a.IncludeLastMessage == nil || *a.IncludeLastMessage
+			chats, err := s.client.Store().ListChats(ctx, a.Query, a.Limit, a.Page, include, sortBy)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			loc, _ := time.LoadLocation(s.client.ReadPolicy().Timezone)
+			for i := range chats {
+				chats[i].LastMessageTime = chats[i].LastMessageTime.In(loc)
+			}
+			return snapshotResult(chats)
+		}, "", "messages")
 	}))
 }
 
@@ -218,7 +282,7 @@ type getChatArgs struct {
 
 func (s *Server) registerGetChat() {
 	tool := mcp.NewTool("get_chat",
-		mcp.WithDescription(offlineSafePrefix+"Fetch metadata for a single cached chat by JID. Read-only; no side effects. Use list_chats to discover chat JIDs, or get_group_info for live group metadata. Returns a JSON object describing the chat (JID, name, last-message metadata when requested), or the JSON literal `null` when the chat is not in the cache."),
+		mcp.WithDescription(snapshotReadPrefix+"Fetch metadata for a single cached chat by JID. Read-only; no side effects. Use list_chats to discover chat JIDs, or get_group_info for live group metadata. Returns a JSON object describing the chat (JID, name, last-message metadata when requested), or the JSON literal `null` when the chat is not in the cache."),
 		mcp.WithString("chat_jid", mcp.Required(), mcp.Description(jidDesc)),
 		mcp.WithBoolean("include_last_message", mcp.DefaultBool(true), mcp.Description("if true, include the chat's most recent message in the result (defaults to true)")),
 		mcp.WithReadOnlyHintAnnotation(true),
@@ -226,16 +290,28 @@ func (s *Server) registerGetChat() {
 		mcp.WithIdempotentHintAnnotation(true),
 		mcp.WithOpenWorldHintAnnotation(false),
 	)
-	s.mcp.AddTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a getChatArgs) (*mcp.CallToolResult, error) {
-		include := a.IncludeLastMessage == nil || *a.IncludeLastMessage
-		chat, err := s.client.Store().GetChat(ctx, a.ChatJID, include)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+	s.registerTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a getChatArgs) (*mcp.CallToolResult, error) {
+		if s.client != nil {
+			chat, err := s.readChatReference(a.ChatJID)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			a.ChatJID = chat
 		}
-		if chat == nil {
-			return mcp.NewToolResultText("null"), nil
-		}
-		return resultJSON(chat)
+
+		return s.cachedRead(ctx, func(ctx context.Context) (*mcp.CallToolResult, error) {
+			include := a.IncludeLastMessage == nil || *a.IncludeLastMessage
+			chat, err := s.client.Store().GetChat(ctx, a.ChatJID, include)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			if chat == nil {
+				return snapshotResult(nil)
+			}
+			loc, _ := time.LoadLocation(s.client.ReadPolicy().Timezone)
+			chat.LastMessageTime = chat.LastMessageTime.In(loc)
+			return snapshotResult(chat)
+		}, a.ChatJID, "messages")
 	}))
 }
 
@@ -250,7 +326,7 @@ type getMessageContextArgs struct {
 
 func (s *Server) registerGetMessageContext() {
 	tool := mcp.NewTool("get_message_context",
-		mcp.WithDescription(offlineSafePrefix+"Fetch a specific cached message and the surrounding messages in its chat. Read-only; no side effects. Use list_messages for searching across many chats. Returns a JSON object with the target message and arrays of messages before and after it."),
+		mcp.WithDescription(snapshotReadPrefix+"Fetch a specific cached message and the surrounding messages in its chat. Read-only; no side effects. Use list_messages for searching across many chats. Returns a JSON object with the target message and arrays of messages before and after it."),
 		mcp.WithString("chat_jid", mcp.Description("Chat containing the message; required when the message ID occurs in multiple chats")),
 		mcp.WithString("message_id", mcp.Required(), mcp.Description("WhatsApp message ID of the target message (use `message_id` from list_messages)")),
 		mcp.WithNumber("before", mcp.DefaultNumber(5), mcp.Description("messages to fetch before the target (default 5; non-positive values fall back to the default)")),
@@ -260,26 +336,44 @@ func (s *Server) registerGetMessageContext() {
 		mcp.WithIdempotentHintAnnotation(true),
 		mcp.WithOpenWorldHintAnnotation(false),
 	)
-	s.mcp.AddTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a getMessageContextArgs) (*mcp.CallToolResult, error) {
-		before, after := a.Before, a.After
-		if before <= 0 {
-			before = 5
+	s.registerTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a getMessageContextArgs) (*mcp.CallToolResult, error) {
+		if s.client != nil {
+			chat, err := s.readChatReference(a.ChatJID)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			a.ChatJID = chat
 		}
-		if after <= 0 {
-			after = 5
-		}
-		if before > 100 {
-			before = 100
-		}
-		if after > 100 {
-			after = 100
-		}
-		ctxResult, err := s.client.Store().GetMessageContext(ctx, a.MessageID, before, after, a.ChatJID)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		_, ctxResult.Message.Mentions, ctxResult.Message.MentionsMe = s.client.Store().RenderMentions(ctx, ctxResult.Message, true)
-		return resultJSON(ctxResult)
+
+		return s.cachedRead(ctx, func(ctx context.Context) (*mcp.CallToolResult, error) {
+			before, after := a.Before, a.After
+			if before <= 0 {
+				before = 5
+			}
+			if after <= 0 {
+				after = 5
+			}
+			if before > 100 {
+				return mcp.NewToolResultError("before exceeds the context budget of 100"), nil
+			}
+			if after > 100 {
+				return mcp.NewToolResultError("after exceeds the context budget of 100"), nil
+			}
+			ctxResult, err := s.client.Store().GetMessageContext(ctx, a.MessageID, before, after, a.ChatJID)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			_, ctxResult.Message.Mentions, ctxResult.Message.MentionsMe = s.client.Store().RenderMentions(ctx, ctxResult.Message, true)
+			loc, _ := time.LoadLocation(s.client.ReadPolicy().Timezone)
+			ctxResult.Message.Timestamp = ctxResult.Message.Timestamp.In(loc)
+			for i := range ctxResult.Before {
+				ctxResult.Before[i].Timestamp = ctxResult.Before[i].Timestamp.In(loc)
+			}
+			for i := range ctxResult.After {
+				ctxResult.After[i].Timestamp = ctxResult.After[i].Timestamp.In(loc)
+			}
+			return snapshotResult(ctxResult)
+		}, a.ChatJID, "messages")
 	}))
 }
 
@@ -298,7 +392,7 @@ func (s *Server) registerIsOnWhatsApp() {
 		mcp.WithIdempotentHintAnnotation(true),
 		mcp.WithOpenWorldHintAnnotation(true),
 	)
-	s.mcp.AddTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a isOnWhatsAppArgs) (*mcp.CallToolResult, error) {
+	s.registerTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a isOnWhatsAppArgs) (*mcp.CallToolResult, error) {
 		if len(a.Phones) == 0 {
 			return mcp.NewToolResultError("phones must not be empty"), nil
 		}
@@ -320,7 +414,7 @@ func (s *Server) registerGetStatus() {
 		mcp.WithIdempotentHintAnnotation(true),
 		mcp.WithOpenWorldHintAnnotation(false),
 	)
-	s.mcp.AddTool(tool, func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	s.registerTool(tool, func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		status := map[string]any{
 			"connected": s.client.IsConnected(),
 		}
@@ -353,7 +447,7 @@ func (s *Server) registerPairingStatus() {
 		mcp.WithIdempotentHintAnnotation(true),
 		mcp.WithOpenWorldHintAnnotation(false),
 	)
-	s.mcp.AddTool(tool, func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	s.registerTool(tool, func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		var ownJID, ownPhone string
 		ready := false
 		// Short-circuits before touching s.client unless we are paired, so a

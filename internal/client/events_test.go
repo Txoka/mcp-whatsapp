@@ -28,7 +28,7 @@ func TestNormalizeIncomingMessage_LIDOriginSender(t *testing.T) {
 	if nm.chatJID != "447700000002@s.whatsapp.net" {
 		t.Errorf("chatJID = %q, want normalised phone JID", nm.chatJID)
 	}
-	if nm.msg.Sender != "447700000002" {
+	if nm.msg.Sender != "447700000002@s.whatsapp.net" {
 		t.Errorf("sender = %q, want \"447700000002\"", nm.msg.Sender)
 	}
 	if nm.msg.Content != "hi from lid" {
@@ -59,7 +59,7 @@ func TestNormalizeIncomingMessage_GroupChat(t *testing.T) {
 	if nm.chatJID != "123456789@g.us" {
 		t.Errorf("chatJID = %q, want group JID unchanged", nm.chatJID)
 	}
-	if nm.msg.Sender != "447700000002" {
+	if nm.msg.Sender != "447700000002@s.whatsapp.net" {
 		t.Errorf("sender = %q, want LID-resolved phone", nm.msg.Sender)
 	}
 }
@@ -80,7 +80,7 @@ func TestNormalizeIncomingMessage_IsFromMe(t *testing.T) {
 		&waProto.Message{Conversation: proto.String("sent by me")},
 	)
 
-	if nm.msg.Sender != "myownid" {
+	if nm.msg.Sender != "myownid@s.whatsapp.net" {
 		t.Errorf("sender = %q, want \"myownid\" from ownID fallback", nm.msg.Sender)
 	}
 	if !nm.msg.IsFromMe {
@@ -144,7 +144,7 @@ func TestNormalizeIncomingMessage_DirectChatNoLID(t *testing.T) {
 	if nm.chatJID != "447700000001@s.whatsapp.net" {
 		t.Errorf("chatJID = %q, want unchanged", nm.chatJID)
 	}
-	if nm.msg.Sender != "447700000001" {
+	if nm.msg.Sender != "447700000001@s.whatsapp.net" {
 		t.Errorf("sender = %q, want unchanged", nm.msg.Sender)
 	}
 }
@@ -168,5 +168,14 @@ func TestNormalizeIncomingMessage_NilMessage(t *testing.T) {
 	}
 	if nm.msg.MediaType != "" {
 		t.Errorf("mediaType = %q, want empty for nil message", nm.msg.MediaType)
+	}
+}
+
+func TestUnmappedLIDKeepsItsNamespace(t *testing.T) {
+	s := newTestStoreWithLIDMap(t, nil)
+	c := newClientWithStore(t, s)
+	n := c.normalizeIncomingMessage("123@g.us", "999@lid", "999", true, false, "", "m", time.Now(), &waProto.Message{Conversation: proto.String("text")})
+	if n.msg.Sender != "999@lid" {
+		t.Fatalf("unmapped LID became a phone: %q", n.msg.Sender)
 	}
 }

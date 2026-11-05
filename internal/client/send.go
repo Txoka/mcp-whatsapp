@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"google.golang.org/protobuf/proto"
 
@@ -16,7 +15,6 @@ import (
 	"go.mau.fi/whatsmeow/types"
 
 	"github.com/sealjay/mcp-whatsapp/internal/media"
-	"github.com/sealjay/mcp-whatsapp/internal/store"
 )
 
 // SendResult is the public return value from Send/SendMediaWithOptions.
@@ -69,13 +67,12 @@ func (c *Client) send(ctx context.Context, recipient, message, mediaPath string,
 		msg.Conversation = proto.String(message)
 	}
 
-	resp, err := c.wa.SendMessage(ctx, recipientJID, msg)
+	resp, err := c.sendTracked(ctx, recipientJID, msg)
 	if err != nil {
 		return SendResult{Success: false, Message: fmt.Sprintf("Error sending message: %v", err)}
 	}
 
 	// Cache the sent message so local history stays complete.
-	c.persistSent(ctx, recipientJID, resp.ID, message, mediaPath, msg)
 
 	return SendResult{
 		Success: true,
@@ -279,53 +276,4 @@ func documentMimeType(ext string) string {
 		}
 	}
 	return "application/octet-stream"
-}
-
-// persistSent writes a cache row for a message we sent so the local history
-// stays complete regardless of device multiplexing.
-func (c *Client) persistSent(ctx context.Context, recipientJID types.JID, msgID, message, mediaPath string, msg *waProto.Message) {
-	chatJID := recipientJID.String()
-	if !strings.HasSuffix(chatJID, "@g.us") {
-		chatJID = c.store.ResolveLIDToJID(chatJID)
-	}
-
-	chatName := c.resolveChatNameFallback(ctx, recipientJID, "")
-
-	now := time.Now()
-	if err := c.store.StoreChat(chatJID, chatName, now); err != nil {
-		c.log.Warnf("Failed to store chat for sent message: %v", err)
-	}
-
-	ourJID := ""
-	if c.wa.Store.ID != nil {
-		ourJID = c.wa.Store.ID.User
-	}
-
-	var (
-		storedMediaType, storedFilename, storedURL, storedDirectPath string
-		storedMediaKey, storedFileSHA256, storedFileEnc              []byte
-		storedFileLength                                             uint64
-	)
-	if mediaPath != "" {
-		storedMediaType, storedFilename, storedURL, storedDirectPath,
-			storedMediaKey, storedFileSHA256, storedFileEnc, storedFileLength = extractMediaInfo(msg)
-	}
-
-	err := c.store.StoreMessage(ctx, store.Message{
-		ID:         msgID,
-		ChatJID:    chatJID,
-		Sender:     ourJID,
-		Content:    message,
-		Timestamp:  now,
-		IsFromMe:   true,
-		MediaType:  storedMediaType,
-		Filename:   storedFilename,
-		URL:        storedURL,
-		DirectPath: storedDirectPath,
-	}, storedMediaKey, storedFileSHA256, storedFileEnc, storedFileLength)
-	if err != nil {
-		c.log.Warnf("Failed to store sent message: %v", err)
-		return
-	}
-	c.log.Infof("[%s] -> %s [%s]: %s", now.Format("2006-01-02 15:04:05"), c.redactor.JID(chatJID), c.redactor.MsgID(msgID), c.redactor.Body(message))
 }

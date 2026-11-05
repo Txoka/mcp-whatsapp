@@ -11,7 +11,9 @@ import (
 
 // listMessageColumns is the 8-column projection shared by ListMessages and
 // queryContextWindow.
-const listMessageColumns = "messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type"
+const contentStatusSQL = "CASE WHEN EXISTS(SELECT 1 FROM message_conflicts conflict WHERE conflict.chat_jid=messages.chat_jid AND conflict.message_id=messages.id) THEN 'conflicting' WHEN EXISTS(SELECT 1 FROM message_body_state body WHERE body.chat_jid=messages.chat_jid AND body.message_id=messages.id AND body.known=0) THEN 'unknown' ELSE 'known' END"
+
+const listMessageColumns = "messages.timestamp, messages.sender, chats.name, CASE WHEN EXISTS(SELECT 1 FROM message_conflicts conflict WHERE conflict.chat_jid=messages.chat_jid AND conflict.message_id=messages.id) THEN '[content unavailable: conflicting unversioned copies]' ELSE messages.content END, messages.is_from_me, chats.jid, messages.id, messages.media_type" + ", " + contentStatusSQL
 
 // ListMessagesParams holds the filters accepted by ListMessages. Zero values
 // mean "unset" except for Limit, which defaults to 20 when <= 0.
@@ -40,8 +42,8 @@ func (s *Store) ListMessages(ctx context.Context, params ListMessagesParams) ([]
 		limit = 20
 	}
 	page := params.Page
-	if page < 0 {
-		page = 0
+	if page < 0 || page > int(^uint(0)>>1)/limit {
+		return nil, fmt.Errorf("page outside supported offset range")
 	}
 
 	var (
@@ -76,6 +78,17 @@ func (s *Store) ListMessages(ctx context.Context, params ListMessagesParams) ([]
 		args = append(args, params.ChatJID)
 	}
 	if params.Query != "" {
+		clauses := append([]string{}, whereClauses...)
+		clauses = append(clauses, "EXISTS(SELECT 1 FROM message_conflicts conflict WHERE conflict.chat_jid=messages.chat_jid AND conflict.message_id=messages.id)")
+		var conflicts int
+		if err := s.reader(ctx).QueryRowContext(ctx, "SELECT COUNT(*) FROM messages WHERE "+strings.Join(clauses, " AND "), args...).Scan(&conflicts); err != nil {
+			return nil, err
+		}
+		if conflicts > 0 {
+			return nil, fmt.Errorf("search coverage unknown: conflicting unversioned message content in the requested range")
+		}
+	}
+	if params.Query != "" {
 		whereClauses = append(whereClauses, "LOWER(messages.content) LIKE LOWER(?)")
 		args = append(args, "%"+params.Query+"%")
 	}
@@ -93,7 +106,7 @@ func (s *Store) ListMessages(ctx context.Context, params ListMessagesParams) ([]
 	offset := page * limit
 	args = append(args, limit, offset)
 
-	rows, err := s.db.QueryContext(ctx, b.String(), args...)
+	rows, err := s.reader(ctx).QueryContext(ctx, b.String(), args...)
 	if err != nil {
 		return nil, fmt.Errorf("list messages: %w", err)
 	}
@@ -190,7 +203,7 @@ func (s *Store) ListChats(ctx context.Context, query string, limit, page int, in
 	b.WriteString(" LIMIT ? OFFSET ?")
 	args = append(args, limit, page*limit)
 
-	rows, err := s.db.QueryContext(ctx, b.String(), args...)
+	rows, err := s.reader(ctx).QueryContext(ctx, b.String(), args...)
 	if err != nil {
 		return nil, fmt.Errorf("list chats: %w", err)
 	}
@@ -218,7 +231,7 @@ func (s *Store) GetChat(ctx context.Context, jid string, includeLastMessage bool
 	b.WriteString(chatSelectSQL("c", includeLastMessage))
 	b.WriteString(" WHERE c.jid = ?")
 
-	row := s.db.QueryRowContext(ctx, b.String(), jid)
+	row := s.reader(ctx).QueryRowContext(ctx, b.String(), jid)
 	c, err := scanChatRow(row)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -237,7 +250,7 @@ func (s *Store) GetChat(ctx context.Context, jid string, includeLastMessage bool
 // 1:1 chats are often just the bare phone number.
 func (s *Store) SearchContacts(ctx context.Context, query string) ([]Contact, error) {
 	pattern := "%" + query + "%"
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.reader(ctx).QueryContext(ctx, `
 		SELECT DISTINCT jid, name
 		FROM chats
 		WHERE (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
@@ -303,45 +316,47 @@ func (s *Store) GetMessageContext(ctx context.Context, messageID string, before,
 		filter = chatFilter[0]
 	}
 	var count int
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM messages WHERE id=? AND (?='' OR chat_jid=?)", messageID, filter, filter).Scan(&count); err != nil {
+	if err := s.reader(ctx).QueryRowContext(ctx, "SELECT COUNT(*) FROM messages WHERE id=? AND (?='' OR chat_jid=?)", messageID, filter, filter).Scan(&count); err != nil {
 		return nil, err
 	}
 	if count > 1 {
 		return nil, fmt.Errorf("message ID is ambiguous; provide chat_jid")
 	}
-	row := s.db.QueryRowContext(ctx, `
-		SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type
+	row := s.reader(ctx).QueryRowContext(ctx, `
+		SELECT messages.timestamp, messages.sender, chats.name, CASE WHEN EXISTS(SELECT 1 FROM message_conflicts conflict WHERE conflict.chat_jid=messages.chat_jid AND conflict.message_id=messages.id) THEN '[content unavailable: conflicting unversioned copies]' ELSE messages.content END, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type, `+contentStatusSQL+`
 		FROM messages
 		JOIN chats ON messages.chat_jid = chats.jid
 		WHERE messages.id = ? AND (? = '' OR messages.chat_jid = ?)`, messageID, filter, filter)
 
 	var (
-		ts        time.Time
-		sender    string
-		chatName  sql.NullString
-		content   sql.NullString
-		isFromMe  bool
-		chatJID   string
-		id        string
-		msgChat   string
-		mediaType sql.NullString
+		ts            time.Time
+		sender        string
+		chatName      sql.NullString
+		content       sql.NullString
+		isFromMe      bool
+		chatJID       string
+		id            string
+		msgChat       string
+		mediaType     sql.NullString
+		contentStatus string
 	)
-	if err := row.Scan(&ts, &sender, &chatName, &content, &isFromMe, &chatJID, &id, &msgChat, &mediaType); err != nil {
+	if err := row.Scan(&ts, &sender, &chatName, &content, &isFromMe, &chatJID, &id, &msgChat, &mediaType, &contentStatus); err != nil {
 		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("message with ID %s not found", messageID)
+			return nil, &MissingMessageError{ID: messageID}
 		}
 		return nil, fmt.Errorf("get message context: %w", err)
 	}
 
 	target := Message{
-		ID:        id,
-		ChatJID:   chatJID,
-		Sender:    sender,
-		Content:   content.String,
-		Timestamp: ts,
-		IsFromMe:  isFromMe,
-		MediaType: mediaType.String,
-		ChatName:  chatName.String,
+		ContentStatus: contentStatus,
+		ID:            id,
+		ChatJID:       chatJID,
+		Sender:        sender,
+		Content:       content.String,
+		Timestamp:     ts,
+		IsFromMe:      isFromMe,
+		MediaType:     mediaType.String,
+		ChatName:      chatName.String,
 	}
 	target.IsGroup = strings.HasSuffix(target.ChatJID, "@g.us")
 	target.SenderPhone = s.resolveSenderPhone(target.Sender)
@@ -383,6 +398,9 @@ func (s *Store) GetSenderName(ctx context.Context, senderJID string) string {
 			return name
 		}
 	}
+	if strings.HasSuffix(senderJID, "@lid") {
+		return "Unknown participant"
+	}
 	return senderJID
 }
 
@@ -390,7 +408,7 @@ func (s *Store) GetSenderName(ctx context.Context, senderJID string) string {
 // not found or the stored name is empty.
 func (s *Store) chatNameByJID(ctx context.Context, jid string) string {
 	var name sql.NullString
-	if err := s.db.QueryRowContext(ctx,
+	if err := s.reader(ctx).QueryRowContext(ctx,
 		"SELECT name FROM chats WHERE jid = ? LIMIT 1", jid).Scan(&name); err == nil {
 		return name.String
 	}
@@ -414,7 +432,7 @@ func (s *Store) queryContextWindow(ctx context.Context, chatJID string, anchor t
 		ORDER BY messages.timestamp %s, messages.id %s
 		LIMIT ?`, op, op, order, order)
 
-	rows, err := s.db.QueryContext(ctx, q, chatJID, anchor.UTC(), anchor.UTC(), anchorID, limit)
+	rows, err := s.reader(ctx).QueryContext(ctx, q, chatJID, anchor.UTC(), anchor.UTC(), anchorID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("context window: %w", err)
 	}
@@ -437,27 +455,29 @@ func (s *Store) scanListMessageRow(row interface {
 	Scan(dest ...any) error
 }) (Message, error) {
 	var (
-		ts        time.Time
-		sender    string
-		chatName  sql.NullString
-		content   sql.NullString
-		isFromMe  bool
-		chatJID   string
-		id        string
-		mediaType sql.NullString
+		ts            time.Time
+		sender        string
+		chatName      sql.NullString
+		content       sql.NullString
+		isFromMe      bool
+		chatJID       string
+		id            string
+		mediaType     sql.NullString
+		contentStatus string
 	)
-	if err := row.Scan(&ts, &sender, &chatName, &content, &isFromMe, &chatJID, &id, &mediaType); err != nil {
+	if err := row.Scan(&ts, &sender, &chatName, &content, &isFromMe, &chatJID, &id, &mediaType, &contentStatus); err != nil {
 		return Message{}, err
 	}
 	m := Message{
-		ID:        id,
-		ChatJID:   chatJID,
-		Sender:    sender,
-		Content:   content.String,
-		Timestamp: ts,
-		IsFromMe:  isFromMe,
-		MediaType: mediaType.String,
-		ChatName:  chatName.String,
+		ContentStatus: contentStatus,
+		ID:            id,
+		ChatJID:       chatJID,
+		Sender:        sender,
+		Content:       content.String,
+		Timestamp:     ts,
+		IsFromMe:      isFromMe,
+		MediaType:     mediaType.String,
+		ChatName:      chatName.String,
 	}
 	m.IsGroup = strings.HasSuffix(m.ChatJID, "@g.us")
 	m.SenderPhone = s.resolveSenderPhone(m.Sender)
@@ -504,7 +524,7 @@ func chatSelectSQL(alias string, includeLastMessage bool) string {
 		%s.jid,
 		%s.name,
 		%s.last_message_time,
-		latest_msg.content,
+		CASE WHEN EXISTS(SELECT 1 FROM message_conflicts conflict WHERE conflict.chat_jid=latest_msg.chat_jid AND conflict.message_id=latest_msg.id) THEN '[content unavailable: conflicting unversioned copies]' ELSE latest_msg.content END,
 		latest_msg.sender,
 		latest_msg.is_from_me
 	FROM %s
@@ -512,7 +532,7 @@ func chatSelectSQL(alias string, includeLastMessage bool) string {
 		AND latest_msg.rowid = (
 			SELECT rowid FROM messages
 			WHERE chat_jid = %s.jid
-			ORDER BY timestamp DESC LIMIT 1
+			ORDER BY timestamp DESC,id DESC LIMIT 1
 		)`, alias, alias, alias, from, alias, alias)
 }
 
@@ -544,3 +564,10 @@ func scanChatRow(row interface {
 	c.IsGroup = strings.HasSuffix(c.JID, "@g.us")
 	return c, nil
 }
+
+type MissingMessageError struct{ ID string }
+
+func (e *MissingMessageError) Error() string {
+	return fmt.Sprintf("message with ID %s not found", e.ID)
+}
+func (e *MissingMessageError) Unwrap() error { return sql.ErrNoRows }

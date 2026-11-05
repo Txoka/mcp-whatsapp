@@ -5,9 +5,12 @@ package mcp
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,18 +20,20 @@ import (
 
 type historyBackend interface {
 	Store() *store.Store
-	RequestHistorySync(context.Context, string, time.Time, string, int, bool) (string, error)
-}
-
-type syncAttempt struct {
-	at     time.Time
-	anchor string
-	lid    bool
+	WaitReadReady(context.Context) error
+	FetchHistory(context.Context, string, bool) (client.HistoryBatch, error)
 }
 type historyReader struct {
-	mu       sync.Mutex
-	attempts map[string]syncAttempt
+	mu    sync.Mutex
+	lanes map[string]*readLane
 }
+
+type readLane struct {
+	token chan struct{}
+	users int
+}
+
+const snapshotNote = "Synchronized local snapshot, not an authoritative view of the phone. History coverage and remote edits/deletions may be incomplete."
 
 type messageCursor struct {
 	Time   time.Time `json:"t"`
@@ -76,88 +81,167 @@ func nextCursor(p store.ListMessagesParams, messages []store.Message) string {
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
-// read waits at most three seconds for one automatic history batch. A
-// process-wide bound and per-chat cooldown prevent concurrent query storms.
-// No chat messages, read receipts or group changes are sent.
-func (h *historyReader) read(ctx context.Context, backend historyBackend, p store.ListMessagesParams, auto bool) ([]store.Message, string, string, error) {
-	base := p
-	base.IncludeContext = false
-	messages, err := backend.Store().ListMessages(ctx, base)
-	if err != nil {
+// read waits for catch-up and required history batches. Failed or unconfirmed
+// sync never becomes a successful partial page. No polling or model retries.
+func (h *historyReader) read(ctx context.Context, backend historyBackend, p store.ListMessagesParams) ([]store.Message, string, string, error) {
+	budget := client.ReadTimeout
+	if configured, ok := backend.(interface{ ReadPolicy() client.ReadPolicy }); ok {
+		budget = configured.ReadPolicy().Timeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	if err := waitForRead(ctx, backend, p.ChatJID); err != nil {
 		return nil, "", "", err
 	}
+	base := p
+	base.IncludeContext = false
 	limit := p.Limit
 	if limit <= 0 {
 		limit = 20
 	}
-	status := ""
-	if auto && !p.UnreadOnly && p.ChatJID != "" && len(messages) < limit {
-		anchor, _, _, anchorErr := backend.Store().GetOldestMessage(p.ChatJID)
-		if anchorErr != nil {
-			status = "Initial history is not available yet; a new incoming message or device sync is needed."
-		} else {
-			now := time.Now()
-			h.mu.Lock()
-			if h.attempts == nil {
-				h.attempts = map[string]syncAttempt{}
-			}
-			previous := h.attempts[p.ChatJID]
-			// Retry the same unchanged cursor using PN after a cooldown; this handles
-			// older history spanning WhatsApp's LID migration without model input.
-			lid := true
-			if previous.anchor == anchor {
-				lid = !previous.lid
-			}
-			recent := now.Sub(previous.at) < 30*time.Second
-			globalRecent := false
-			for _, attempt := range h.attempts {
-				if now.Sub(attempt.at) < time.Second {
-					globalRecent = true
-					break
-				}
-			}
-			if !recent && !globalRecent {
-				h.attempts[p.ChatJID] = syncAttempt{now, anchor, lid}
-			}
-			h.mu.Unlock()
-			if recent || globalRecent {
-				status = "Showing cached history; automatic history loading is rate-limited."
-			} else {
-				waitCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-				_, syncErr := backend.RequestHistorySync(waitCtx, p.ChatJID, time.Time{}, client.AnchorOldest, 50, lid)
-				if syncErr != nil {
-					status = "Showing cached history; additional history could not be requested."
-				} else {
-					status = "Showing cached history; additional history is loading. Query again later if needed."
-					ticker := time.NewTicker(150 * time.Millisecond)
-					initialAnchor := anchor
-				wait:
-					for {
-						select {
-						case <-waitCtx.Done():
-							break wait
-						case <-ticker.C:
-							current, queryErr := backend.Store().ListMessages(waitCtx, base)
-							if queryErr != nil {
-								break wait
-							}
-							messages = current
-							oldest, _, _, _ := backend.Store().GetOldestMessage(p.ChatJID)
-							if oldest != initialAnchor {
-								status = "Additional history loaded; older history may still be available."
-								break wait
-							}
-						}
-					}
-					ticker.Stop()
-				}
-				cancel()
+	h.mu.Lock()
+	if h.lanes == nil {
+		h.lanes = map[string]*readLane{}
+	}
+	lane := h.lanes[p.ChatJID]
+	if lane == nil {
+		lane = &readLane{token: make(chan struct{}, 1)}
+		h.lanes[p.ChatJID] = lane
+	}
+	lane.users++
+	h.mu.Unlock()
+	defer func() {
+		h.mu.Lock()
+		lane.users--
+		if lane.users == 0 {
+			delete(h.lanes, p.ChatJID)
+		}
+		h.mu.Unlock()
+	}()
+	select {
+	case lane.token <- struct{}{}:
+		defer func() { <-lane.token }()
+	case <-ctx.Done():
+		return nil, "", "", fmt.Errorf("history synchronization incomplete: %w; results withheld", ctx.Err())
+	}
+	status := snapshotNote
+	triedPN := false
+	for {
+		if err := waitForRead(ctx, backend, p.ChatJID); err != nil {
+			return nil, "", "", err
+		}
+		messages, err := backend.Store().ListMessages(ctx, base)
+		if err != nil {
+			return nil, "", "", err
+		}
+		covered := false
+		if p.ChatJID != "" {
+			covered, err = backend.Store().CoversMessages(ctx, p.ChatJID, messages)
+			if err != nil {
+				return nil, "", "", err
 			}
 		}
+		if p.ChatJID == "" || p.UnreadOnly || (len(messages) >= limit && covered) {
+			cursor := nextCursor(p, messages)
+			if p.IncludeContext {
+				messages, err = backend.Store().ListMessages(ctx, p)
+			}
+			return messages, status, cursor, err
+		}
+		boundary, err := backend.Store().HistoryBoundary(ctx, p.ChatJID)
+		if err != nil {
+			return nil, "", "", err
+		}
+		unknownHead, err := backend.Store().UnconfirmedHead(ctx, p.ChatJID)
+		if err != nil {
+			return nil, "", "", err
+		}
+		if boundary != "unknown" && !unknownHead {
+			if boundary == "inaccessible" && len(messages) < limit {
+				return nil, "", "", fmt.Errorf("history unavailable: WhatsApp reports older messages inaccessible; incomplete page withheld")
+			}
+			if len(messages) > 0 && !covered {
+				return nil, "", "", fmt.Errorf("history coverage unknown for retained messages; results withheld")
+			}
+			status += " WhatsApp history boundary: " + boundary + "."
+			if p.IncludeContext {
+				messages, err = backend.Store().ListMessages(ctx, p)
+			}
+			return messages, status, nextCursor(p, messages), err
+		}
+		anchorKey, err := backend.Store().NextHistoryAnchor(ctx, p.ChatJID)
+		anchor := anchorKey.ID
+		if err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				return nil, "", "", err
+			}
+			return nil, "", "", fmt.Errorf("history unavailable: no usable cached anchor for this chat; initial device history is required; results withheld")
+		}
+		batch, err := backend.FetchHistory(ctx, p.ChatJID, !triedPN)
+		if err != nil {
+			return nil, "", "", fmt.Errorf("history synchronization incomplete: %w; partial results withheld", err)
+		}
+		if err := waitForRead(ctx, backend, p.ChatJID); err != nil {
+			return nil, "", "", err
+		}
+		messages, err = backend.Store().ListMessages(ctx, base)
+		if err != nil {
+			return nil, "", "", err
+		}
+		if batch.Exhausted || batch.Inaccessible {
+			confirmed, err := backend.Store().CoversMessages(ctx, p.ChatJID, messages)
+			if err != nil {
+				return nil, "", "", err
+			}
+			if (batch.Inaccessible && len(messages) < limit) || (len(messages) > 0 && !confirmed) {
+				return nil, "", "", fmt.Errorf("history unavailable: requested page cannot be established from confirmed accessible transfers; partial results withheld")
+			}
+			if batch.Inaccessible {
+				status += " WhatsApp reports older history is inaccessible to this linked device."
+			} else {
+				status += " WhatsApp reports no older messages remain on the primary for this history boundary."
+			}
+			cursor := "" // this request reached an explicit boundary, not an inferred empty page
+			if len(messages) >= limit {
+				cursor = nextCursor(p, messages)
+			}
+			if p.IncludeContext {
+				messages, err = backend.Store().ListMessages(ctx, p)
+			}
+			return messages, status, cursor, err
+		}
+		if len(messages) >= limit {
+			confirmed, err := backend.Store().CoversMessages(ctx, p.ChatJID, messages)
+			if err != nil {
+				return nil, "", "", err
+			}
+			if confirmed {
+				continue
+			}
+		}
+		// A full cached page is not evidence that this transfer made progress.
+		// Recheck coverage at the top, but always detect an unchanged frontier.
+		nextAnchor, err := backend.Store().NextHistoryAnchor(ctx, p.ChatJID)
+		oldest := nextAnchor.ID
+		if err != nil {
+			return nil, "", "", err
+		}
+		if oldest == anchor {
+			if triedPN || !strings.HasSuffix(p.ChatJID, "@s.whatsapp.net") {
+				return nil, "", "", fmt.Errorf("history incomplete: completed batches made no progress and no end-of-history was confirmed; partial results withheld")
+			}
+			triedPN = true
+		} else {
+			triedPN = false
+		}
 	}
-	cursor := nextCursor(p, messages)
-	if p.IncludeContext {
-		messages, err = backend.Store().ListMessages(ctx, p)
+}
+
+func waitForRead(ctx context.Context, backend historyBackend, chat string) error {
+	if scoped, ok := backend.(interface {
+		WaitReadReadyFor(context.Context, string, ...string) error
+	}); ok {
+		return scoped.WaitReadReadyFor(ctx, chat, "messages")
 	}
-	return messages, status, cursor, err
+	return backend.WaitReadReady(ctx)
 }

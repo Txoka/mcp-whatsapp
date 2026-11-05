@@ -83,7 +83,14 @@ func runServe(storeDir string, redactor *security.Redactor, args []string) int {
 		return 1
 	}
 	defer st.Close()
+	if err := st.RecoverInterrupted(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "recover interrupted operations: %v\n", err)
+		return 1
+	}
 
+	if err := st.ReplayPending(ctx, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "pending projection recovery remains incomplete: %v\n", err)
+	}
 	c, err := client.New(ctx, client.Config{
 		StoreDir:         storeDir,
 		Store:            st,

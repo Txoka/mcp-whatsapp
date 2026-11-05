@@ -62,3 +62,44 @@ func TestChatMetadataPrefersPeerContactOverStaleCachedName(t *testing.T) {
 		t.Fatalf("wrong peer name: %s", chat.Name)
 	}
 }
+
+func TestDetailedTimezoneUsesDSTWithoutMutatingStorage(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	for _, sample := range []struct {
+		month        time.Month
+		hour, offset string
+	}{{time.November, "13:07:00", "+01:00"}, {time.July, "14:07:00", "+02:00"}} {
+		messages := []Message{{ID: "image", Timestamp: time.Date(2026, sample.month, 4, 12, 7, 0, 0, time.UTC), MediaType: "image", Content: "caption", ContentStatus: "known"}}
+		got, err := s.FormatMessagesDetailed(ctx, messages, true, "Europe/Madrid")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(got, sample.hour) || !strings.Contains(got, "TZ: "+sample.offset) {
+			t.Fatalf("wrong local time: %s", got)
+		}
+		if messages[0].Timestamp.Location() != time.UTC {
+			t.Fatal("formatter changed stored instant")
+		}
+	}
+}
+func TestUnknownCaptionIsNotReportedAsAbsent(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	m := Message{ID: "image", ChatJID: "caption@g.us", Timestamp: time.Now(), MediaType: "image", ContentStatus: "unknown"}
+	got, err := s.FormatMessagesDetailed(ctx, []Message{m}, false, "Europe/Madrid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "caption not synchronized") {
+		t.Fatal(got)
+	}
+	m.ContentStatus = "known"
+	got, err = s.FormatMessagesDetailed(ctx, []Message{m}, false, "Europe/Madrid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "no caption") {
+		t.Fatal(got)
+	}
+}

@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"github.com/sealjay/mcp-whatsapp/internal/store"
 	"strings"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 
@@ -35,12 +37,10 @@ func (c *Client) SendPoll(ctx context.Context, recipient, question string, optio
 	// MessageContextInfo so that votes on the poll can be decrypted later.
 	msg := c.wa.BuildPollCreation(question, options, selectableCount)
 
-	resp, err := c.wa.SendMessage(ctx, recipientJID, msg)
+	resp, err := c.sendTracked(ctx, recipientJID, msg)
 	if err != nil {
 		return SendResult{Success: false, Message: fmt.Sprintf("Error sending poll: %v", err)}
 	}
-
-	c.persistSent(ctx, recipientJID, resp.ID, question, "", msg)
 
 	// Cache option names locally so incoming vote SHA-256 hashes can be reversed.
 	if err := c.store.StorePollMetadata(ctx, resp.ID, recipientJID.String(), options); err != nil {
@@ -101,11 +101,21 @@ func (c *Client) SendPollVote(ctx context.Context, chatJID, pollMessageID string
 		return SendResult{Success: false, Message: fmt.Sprintf("Error building poll vote: %v", err)}
 	}
 
-	resp, err := c.wa.SendMessage(ctx, chat, voteMsg)
+	voteEvent, err := store.NewPollVoteEvent(pollMessageID, c.store.ResolveLIDToJID(chatJID), c.wa.Store.ID.ToNonAD().String(), options, time.Time{})
+	if err != nil {
+		return SendResult{Success: false, Message: err.Error()}
+	}
+	resp, err := c.sendTracked(ctx, chat, voteMsg, voteEvent)
 	if err != nil {
 		return SendResult{Success: false, Message: fmt.Sprintf("Error sending poll vote: %v", err)}
 	}
 
+	if c.wa.Store.ID != nil {
+		if err := c.store.StorePollVote(context.Background(), pollMessageID, c.store.ResolveLIDToJID(chatJID), c.wa.Store.ID.ToNonAD().String(), options, resp.Timestamp); err != nil {
+			c.syncState.recordFailure(err)
+			return SendResult{Success: true, ID: resp.ID, Message: "Vote accepted; local tally update incomplete"}
+		}
+	}
 	return SendResult{
 		Success: true,
 		Message: fmt.Sprintf("Poll vote sent to %s", chatJID),
@@ -207,12 +217,10 @@ func (c *Client) SendContactCard(ctx context.Context, recipient, name, phone, vc
 		},
 	}
 
-	resp, err := c.wa.SendMessage(ctx, recipientJID, msg)
+	resp, err := c.sendTracked(ctx, recipientJID, msg)
 	if err != nil {
 		return SendResult{Success: false, Message: fmt.Sprintf("Error sending contact card: %v", err)}
 	}
-
-	c.persistSent(ctx, recipientJID, resp.ID, displayName+" (contact card)", "", msg)
 
 	return SendResult{
 		Success: true,

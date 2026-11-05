@@ -33,3 +33,61 @@ messages. Cached attachment files are retained (`deleteMedia=false`).
 
 Validation uses isolated tests; no real messages are deleted as tests. Successful
 submission does not prove that every linked client has applied the deletion.
+
+## Transparent synchronized reads
+
+The agent-facing `list_messages` schema has no `auto_sync` switch. Cache-only
+inspection remains possible through local diagnostics, not an agent argument.
+Cache-backed reads wait for connection catch-up and active history imports.
+Disconnected or failed synchronization does not silently return cached data.
+
+A selected-chat query that needs more history waits for its correlated ON_DEMAND
+response to be imported. Partial chunks do not complete a request. Reads continue
+through completed batches, with the existing request cooldowns handled internally.
+The total synchronization budget is two minutes, subject to earlier cancellation.
+Timeout, import failure, missing correlation, or a response that cannot advance
+history without an explicit boundary returns an error and withholds partial rows.
+Concurrent reads of a chat share newly loaded data rather than fetching in parallel.
+
+Global searches and unread queries cover synchronized local state; they do not
+claim to scan every message on the phone. Explicit WhatsApp end/inaccessible-history
+markers are distinguished from timeout. All cached read results state that coverage
+and remote edits/deletions may be incomplete. No protocol mechanism proves a fully
+current authoritative phone snapshot.
+
+## Concurrent account-state updates
+
+Delete-for-me updates serialize the full account-state operation, not just the
+library fetch phase. Each update fetches the latest collection state first.
+A mismatching LTHash triggers a full rebuild of that local collection from the
+server. No device logout or server-side account reset is requested. A failure
+after sending is reported as an unknown outcome; the mutation is never retried
+by our wrapper. Recovery fetches can deliver deletion events already accepted by
+WhatsApp. Users should not blindly retry uncertain deletions.
+
+## Transactional architecture
+
+See [architecture](ARCHITECTURE.md) for component boundaries and exact guarantees.
+Normalized input is captured durably and projected atomically. Message revisions,
+tombstones, read markers and poll votes use explicit ordering rules; unversioned
+conflicts are unavailable rather than presented as known text. Related reads use
+one committed snapshot. Outgoing operations and uncertain outcomes survive restart.
+
+History requests retain confirmed transfer membership/spans and real continuation
+keys. Fixed one-second and thirty-second pacing and the missing-metadata completion
+fallback are removed. Operator resource policy is separate from WhatsApp limits;
+server backoff is handled by the updated pinned SDK. Unread-chat results support
+page/next_page, and resource-limit errors replace silent clamping.
+
+- Display detailed messages and JSON chat/context timestamps in the configured
+  IANA timezone; retain UTC storage and DST-aware offsets.
+- Preserve caption provenance, repair legacy unknown captions when available, and
+  return caption metadata alongside downloaded media.
+- Persist outgoing local projections before submission and replay acknowledged
+  operations without resending them after cancellation or restart.
+
+- Return compact persistent message-page/update-watch bookmarks, bound to their
+  filters and purpose; preserve old cursor formats and numbered message pages.
+- Detect no-progress transfers even when the cached page is full. PN/LID fallback
+  applies to direct chats only; groups do not repeat the same request under an
+  identity mode that cannot apply to groups.

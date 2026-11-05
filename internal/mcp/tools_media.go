@@ -35,7 +35,7 @@ func (s *Server) registerSendPoll() {
 		mcp.WithIdempotentHintAnnotation(false),
 		mcp.WithOpenWorldHintAnnotation(true),
 	)
-	s.mcp.AddTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a sendPollArgs) (*mcp.CallToolResult, error) {
+	s.registerTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a sendPollArgs) (*mcp.CallToolResult, error) {
 		if r := requireNonEmpty("recipient", a.Recipient); r != nil {
 			return r, nil
 		}
@@ -70,7 +70,7 @@ func (s *Server) registerSendPollVote() {
 		mcp.WithIdempotentHintAnnotation(true),
 		mcp.WithOpenWorldHintAnnotation(true),
 	)
-	s.mcp.AddTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a sendPollVoteArgs) (*mcp.CallToolResult, error) {
+	s.registerTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a sendPollVoteArgs) (*mcp.CallToolResult, error) {
 		if r := requireNonEmpty("chat_jid", a.ChatJID); r != nil {
 			return r, nil
 		}
@@ -95,7 +95,7 @@ type getPollResultsArgs struct {
 
 func (s *Server) registerGetPollResults() {
 	tool := mcp.NewTool("get_poll_results",
-		mcp.WithDescription(offlineSafePrefix+"Return the current vote tally for a cached poll. Read-only; no side effects. Zero-vote options are included so the response always lists every original option. Returns a JSON object `{poll_message_id, chat_jid, tally}` where `tally` is `option_label -> vote_count`."),
+		mcp.WithDescription(snapshotReadPrefix+"Return the current vote tally for a cached poll. Read-only; no side effects. Zero-vote options are included so the response always lists every original option. Returns a JSON object `{poll_message_id, chat_jid, tally}` where `tally` is `option_label -> vote_count`."),
 		mcp.WithString("chat_jid", mcp.Required(), mcp.Description(jidDesc)),
 		mcp.WithString("poll_message_id", mcp.Required(), mcp.Description("WhatsApp message ID of the poll to tally (use `ID` from send_poll, or `message_id` from list_messages)")),
 		mcp.WithReadOnlyHintAnnotation(true),
@@ -103,21 +103,23 @@ func (s *Server) registerGetPollResults() {
 		mcp.WithIdempotentHintAnnotation(true),
 		mcp.WithOpenWorldHintAnnotation(false),
 	)
-	s.mcp.AddTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a getPollResultsArgs) (*mcp.CallToolResult, error) {
-		if r := requireNonEmpty("chat_jid", a.ChatJID); r != nil {
-			return r, nil
-		}
-		if r := requireNonEmpty("poll_message_id", a.PollMessageID); r != nil {
-			return r, nil
-		}
-		r, err := s.client.GetPollResults(ctx, a.ChatJID, a.PollMessageID)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return mcp.NewToolResultError("poll: not found in cache (wait for message sync)"), nil
+	s.registerTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a getPollResultsArgs) (*mcp.CallToolResult, error) {
+		return s.cachedRead(ctx, func(ctx context.Context) (*mcp.CallToolResult, error) {
+			if r := requireNonEmpty("chat_jid", a.ChatJID); r != nil {
+				return r, nil
 			}
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		return resultJSON(r)
+			if r := requireNonEmpty("poll_message_id", a.PollMessageID); r != nil {
+				return r, nil
+			}
+			r, err := s.client.GetPollResults(ctx, a.ChatJID, a.PollMessageID)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return mcp.NewToolResultError("poll: not found in cache (wait for message sync)"), nil
+				}
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return snapshotResult(r)
+		}, a.ChatJID, "messages")
 	}))
 }
 
@@ -140,7 +142,7 @@ func (s *Server) registerSendContactCard() {
 		mcp.WithIdempotentHintAnnotation(false),
 		mcp.WithOpenWorldHintAnnotation(true),
 	)
-	s.mcp.AddTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a sendContactCardArgs) (*mcp.CallToolResult, error) {
+	s.registerTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a sendContactCardArgs) (*mcp.CallToolResult, error) {
 		if r := requireNonEmpty("recipient", a.Recipient); r != nil {
 			return r, nil
 		}

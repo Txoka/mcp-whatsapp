@@ -14,7 +14,7 @@ func TestMentionMetadataResolutionAndRawTextPreserved(t *testing.T) {
 	if err := s.SetOwnIdentity("111@s.whatsapp.net", "777@lid"); err != nil {
 		t.Fatal(err)
 	}
-	m := incoming(t, s, chat, "mention", time.Now())
+	m := Message{ID: "mention", ChatJID: chat, Sender: "222", Timestamp: time.Now()}
 	m.Content = "@777 help @999 and literal @7777"
 	m.MentionJIDs = []string{"777@lid", "999@lid", "777@lid"}
 	if err := s.StoreMessage(ctx, m, nil, nil, nil, 0); err != nil {

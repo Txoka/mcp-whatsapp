@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/sealjay/mcp-whatsapp/internal/store"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
 )
@@ -40,6 +41,9 @@ const DefaultSyncCount = 50
 // count bounds the batch size; zero means DefaultSyncCount. Returns a
 // human-readable status.
 func (c *Client) RequestHistorySync(ctx context.Context, chatJID string, fromTimestamp time.Time, anchor string, count int, useLID bool) (string, error) {
+	return c.requestHistorySync(ctx, chatJID, fromTimestamp, anchor, count, useLID, "")
+}
+func (c *Client) requestHistorySync(ctx context.Context, chatJID string, fromTimestamp time.Time, anchor string, count int, useLID bool, requestID types.MessageID, explicit ...store.HistoryAnchor) (string, error) {
 	c.log.Infof("[SYNC] Requesting history sync for chat: %s (anchor=%q, from=%v)", chatJID, anchor, fromTimestamp)
 
 	if c.wa == nil || !c.wa.IsConnected() {
@@ -58,7 +62,17 @@ func (c *Client) RequestHistorySync(ctx context.Context, chatJID string, fromTim
 		count = DefaultSyncCount
 	}
 
-	msgID, timestamp, isFromMe, describe, err := c.resolveAnchor(chatJID, fromTimestamp, anchor)
+	var msgID, describe string
+	var timestamp time.Time
+	var isFromMe bool
+	if len(explicit) > 0 {
+		msgID = explicit[0].ID
+		timestamp = explicit[0].Timestamp
+		isFromMe = explicit[0].IsFromMe
+		describe = "confirmed history frontier"
+	} else {
+		msgID, timestamp, isFromMe, describe, err = c.resolveAnchor(chatJID, fromTimestamp, anchor)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -102,7 +116,7 @@ func (c *Client) RequestHistorySync(ctx context.Context, chatJID string, fromTim
 	c.log.Infof("[SYNC] Request details: ChatJID=%s (request uses %s), MsgID=%s, IsFromMe=%v, Timestamp=%v, Count=%d",
 		chatJID, requestJID.String(), msgID, isFromMe, timestamp, count)
 
-	resp, err := c.wa.SendMessage(ctx, ownJID, historyMsg, whatsmeow.SendRequestExtra{Peer: true})
+	resp, err := c.wa.SendMessage(ctx, ownJID, historyMsg, whatsmeow.SendRequestExtra{Peer: true, ID: requestID})
 	if err != nil {
 		return "", fmt.Errorf("failed to send sync request: %v", err)
 	}

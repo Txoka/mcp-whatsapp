@@ -18,6 +18,9 @@ fi
 
 methods=(
   SendMessage
+  GenerateMessageID
+  FetchAppState
+  SendAppState
   Upload
   Download
   GetGroupInfo

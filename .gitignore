@@ -14,3 +14,7 @@ cover.out
 # Machine-specific deployment settings and private handoff
 /.env
 /docs/PROJECT_HANDOFF.md
+
+# Local Python helper bytecode
+__pycache__/
+*.py[cod]

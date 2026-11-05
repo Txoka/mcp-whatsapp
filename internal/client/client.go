@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/mdp/qrterminal"
@@ -33,6 +34,12 @@ type Config struct {
 
 // Client wraps a whatsmeow.Client together with the message cache and logger.
 type Client struct {
+	policy           ReadPolicy
+	historyQueue     chan struct{}
+	accountState     accountStateWriter
+	syncState        readSyncState
+	historyLane      chan struct{}
+	historyLaneOnce  sync.Once
 	wa               *whatsmeow.Client
 	downloadMedia    func(context.Context, whatsmeow.DownloadableMessage) ([]byte, error)
 	store            *store.Store
@@ -54,6 +61,10 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		return nil, errors.New("client: Config.StoreDir is required")
 	}
 
+	policy, err := readPolicyFromEnv()
+	if err != nil {
+		return nil, err
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = NewStderrLogger("Client", "INFO", true)
@@ -113,6 +124,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 
 	wa.EmitAppStateEventsOnFullSync = true
 	return &Client{
+		policy:           policy,
 		wa:               wa,
 		downloadMedia:    wa.Download,
 		store:            cfg.Store,

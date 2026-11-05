@@ -1,4 +1,4 @@
-> Fork: compact history, verified participant identities, mention metadata, unread-state queries and event-driven waits. See [fork changes](docs/FORK_CHANGES.md) and [local setup](docs/LOCAL_SETUP.md).
+> Fork: compact history, verified participant identities, mention metadata, unread-state queries and event-driven waits. See [fork changes](docs/FORK_CHANGES.md), [architecture](docs/ARCHITECTURE.md), and [local setup](docs/LOCAL_SETUP.md).
 
 # WhatsApp MCP Server
 
@@ -19,9 +19,9 @@ A single-binary Go [MCP](https://modelcontextprotocol.io/) server that wraps [wh
 This started as a fork of [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp) and has since been rewritten as a single Go binary. What it adds over the original:
 
 - **LID resolution** — normalises `@lid` JIDs to real phone numbers for accurate contact matching.
-- **Sent-message storage** — outgoing messages are persisted locally so conversation history stays complete.
+- **Sent-message storage** — outgoing messages are persisted locally; history coverage still depends on WhatsApp.
 - **Disappearing-message timers** — outgoing messages inherit the group chat's ephemeral timer automatically.
-- **Targeted history sync** — automatic per-chat backfill while reading messages.
+- **Transparent history loading** — reads wait for required history batches; unconfirmed sync returns an error instead of a partial page.
 - **Extended tool surface** — 42 tools (see below): reactions, replies, edits, revoke, mark-read, typing, is-on-whatsapp, full group admin, blocklist, polls (create + vote + tally), contact cards, view-once flag, presence, privacy settings, and the profile "About" text.
 - **Single-instance enforcement** — a `flock(2)` on `store/.lock` prevents two `serve` processes racing on the same SQLite files.
 
@@ -128,7 +128,7 @@ internal/security/      path allowlisting, filename sanitisation, log redaction
 internal/store/         SQLite cache, LID resolution, query layer
 ```
 
-Data lives under `./store/` (`-store DIR`): `messages.db` (message cache), `whatsapp.db` (whatsmeow session) and `.lock`. Query tools read SQLite; send and action tools call whatsmeow; incoming events are written to SQLite by a goroutine in the same process.
+Data lives under `./store/` (`-store DIR`): `messages.db` (message cache), `whatsapp.db` (whatsmeow session) and `.lock`. Cache-backed query tools wait for local catch-up, then read SQLite with explicit coverage limits; send and action tools call whatsmeow; incoming events are written to SQLite by a goroutine in the same process.
 
 ## Tools
 
@@ -271,3 +271,12 @@ Contributions welcome via pull request. See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## Licence
 
 MIT Licence — see [LICENSE](LICENSE).
+
+### Continuations
+
+For older messages, copy the short `cursor` from the returned “Next page” block
+into `list_messages` with the same filters. Do not increment it or combine it
+with `page`; numbered message pages are retained for older clients. For waits,
+copy the returned `cursor` into `wait_for_updates` with the same chat and `kind`.
+Page and watch bookmarks are separate, survive service restarts, and do not expose
+message identifiers. Legacy cursor formats remain accepted.

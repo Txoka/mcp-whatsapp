@@ -9,6 +9,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"github.com/sealjay/mcp-whatsapp/internal/store"
 	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/proto/waSyncAction"
@@ -111,7 +112,7 @@ func (c *Client) SendReaction(ctx context.Context, chatJID, messageID, senderJID
 	}
 
 	reaction := c.wa.BuildReaction(chat, sender, types.MessageID(messageID), emoji)
-	if _, err := c.wa.SendMessage(ctx, chat, reaction); err != nil {
+	if _, err := c.sendTracked(ctx, chat, reaction); err != nil {
 		return fmt.Errorf("send reaction: %w", err)
 	}
 	return nil
@@ -152,7 +153,8 @@ func (c *Client) SendReply(ctx context.Context, chatJID, targetMessageID, target
 		MessageContextInfo: c.ephemeralContextInfo(ctx, chat),
 	}
 
-	if _, err := c.wa.SendMessage(ctx, chat, msg); err != nil {
+	_, err = c.sendTracked(ctx, chat, msg)
+	if err != nil {
 		return fmt.Errorf("send reply: %w", err)
 	}
 	return nil
@@ -173,10 +175,8 @@ func (c *Client) EditMessage(ctx context.Context, chatJID, messageID, newBody st
 		Conversation: proto.String(newBody),
 	}
 	edit := c.wa.BuildEdit(chat, types.MessageID(messageID), newContent)
-	if _, err := c.wa.SendMessage(ctx, chat, edit); err != nil {
-		return fmt.Errorf("send edit: %w", err)
-	}
-	return nil
+	event := store.MessageEvent{Kind: "edit", Message: store.Message{ChatJID: c.store.ResolveLIDToJID(chatJID), ID: messageID, Content: newBody}, RevisionMS: unwrapHistoryMessage(edit).GetProtocolMessage().GetTimestampMS()}
+	return c.applyTrackedMutation(ctx, event, func(ctx context.Context) error { _, err := c.wa.SendMessage(ctx, chat, edit); return err })
 }
 
 // DeleteMessage requires an explicit everyone or me scope. senderJID is required only
@@ -205,10 +205,7 @@ func (c *Client) DeleteMessage(ctx context.Context, chatJID, messageID, senderJI
 	}
 
 	revoke := c.wa.BuildRevoke(chat, sender, types.MessageID(messageID))
-	if _, err := c.wa.SendMessage(ctx, chat, revoke); err != nil {
-		return fmt.Errorf("send revoke: %w", err)
-	}
-	return nil
+	return c.applyTrackedMutation(ctx, store.MessageEvent{Kind: "revoke", Message: store.Message{ChatJID: c.store.ResolveLIDToJID(chatJID), ID: messageID}}, func(ctx context.Context) error { _, err := c.wa.SendMessage(ctx, chat, revoke); return err })
 }
 
 // SendTyping sets chat presence to "composing" when active is true, or
@@ -280,6 +277,8 @@ func (c *Client) IsOnWhatsApp(ctx context.Context, phones []string) (map[string]
 
 // deleteMessageForMe sends an account-state mutation, never a revoke.
 func (c *Client) deleteMessageForMe(ctx context.Context, chatJID, messageID string) error {
+	finish := c.syncState.processing()
+	defer finish(nil)
 	if !c.wa.IsConnected() {
 		return errors.New("not connected to WhatsApp")
 	}
@@ -307,13 +306,7 @@ func (c *Client) deleteMessageForMe(ctx context.Context, chatJID, messageID stri
 		}
 	}
 	patch := deleteForMePatch(chat.String(), sender, messageID, fromMe, m.Timestamp)
-	if err = c.wa.SendAppState(ctx, patch); err != nil {
-		return fmt.Errorf("send delete-for-me: %w", err)
-	}
-	if err = c.store.DeleteForMe(ctx, chatJID, messageID); err != nil {
-		return fmt.Errorf("WhatsApp accepted deletion but local cleanup failed: %w", err)
-	}
-	return nil
+	return c.applyTrackedMutation(ctx, store.MessageEvent{Kind: "delete_me", Message: m}, func(ctx context.Context) error { return c.accountState.send(ctx, c.wa, patch) })
 }
 func deleteForMePatch(chat, sender, id, fromMe string, ts time.Time) appstate.PatchInfo {
 	return appstate.PatchInfo{Type: appstate.WAPatchRegularHigh, Mutations: []appstate.MutationInfo{{

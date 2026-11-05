@@ -55,7 +55,7 @@ func (s *Store) FormatMessage(ctx context.Context, m Message, showChatInfo bool)
 	b.WriteString(senderName)
 	b.WriteString(": ")
 	b.WriteString(contentPrefix)
-	b.WriteString(m.Content)
+	b.WriteString(visibleMessageText(m, m.Content))
 	b.WriteString("\n")
 
 	return b.String()
@@ -126,8 +126,29 @@ func (s *Store) FormatMessagesCompact(ctx context.Context, msgs []Message, timez
 		if mentionsMe {
 			b.WriteString("[mentions you] ")
 		}
-		b.WriteString(strings.ReplaceAll(text, "\n", "\n  "))
+		b.WriteString(strings.ReplaceAll(visibleMessageText(m, text), "\n", "\n  "))
 		b.WriteByte('\n')
 	}
 	return b.String(), nil
+}
+
+func visibleMessageText(m Message, text string) string {
+	if m.ContentStatus == "unknown" {
+		return "[caption not synchronized]"
+	}
+	if m.ContentStatus == "known" && text == "" && (m.MediaType == "image" || m.MediaType == "video" || m.MediaType == "document") {
+		return "[no caption]"
+	}
+	return text
+}
+func (s *Store) FormatMessagesDetailed(ctx context.Context, messages []Message, showChat bool, timezone string) (string, error) {
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		return "", err
+	}
+	localized := append([]Message(nil), messages...)
+	for i := range localized {
+		localized[i].Timestamp = localized[i].Timestamp.In(loc)
+	}
+	return "Timezone: " + timezone + "\n" + s.FormatMessagesList(ctx, localized, showChat), nil
 }
