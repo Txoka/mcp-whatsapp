@@ -12,11 +12,12 @@ import (
 type ReadPolicy struct {
 	Timezone                                                                  string
 	Timeout                                                                   time.Duration
+	RecentSyncTimeout                                                         time.Duration
 	HistoryConcurrency, HistoryQueue, HistoryBatch, MaxPage, MaxResponseBytes int
 }
 
 func DefaultReadPolicy() ReadPolicy {
-	return ReadPolicy{Timeout: ReadTimeout, Timezone: "UTC", HistoryConcurrency: 1, HistoryQueue: 64, HistoryBatch: 50, MaxPage: 100, MaxResponseBytes: 256 * 1024}
+	return ReadPolicy{Timeout: ReadTimeout, RecentSyncTimeout: 3 * time.Second, Timezone: "UTC", HistoryConcurrency: 1, HistoryQueue: 64, HistoryBatch: 50, MaxPage: 100, MaxResponseBytes: 256 * 1024}
 }
 func readPolicyFromEnv() (ReadPolicy, error) {
 	p := DefaultReadPolicy()
@@ -47,6 +48,13 @@ func readPolicyFromEnv() (ReadPolicy, error) {
 			return p, fmt.Errorf("WHATSAPP_READ_TIMEOUT must be a positive duration")
 		}
 		p.Timeout = d
+	}
+	if raw := os.Getenv("WHATSAPP_RECENT_SYNC_TIMEOUT"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			return p, fmt.Errorf("WHATSAPP_RECENT_SYNC_TIMEOUT must be a positive duration")
+		}
+		p.RecentSyncTimeout = d
 	}
 	if p.HistoryQueue < p.HistoryConcurrency {
 		return p, fmt.Errorf("history queue must accommodate all active requests")

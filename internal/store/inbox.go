@@ -149,3 +149,9 @@ func (s *Store) ProjectionApplied(ctx context.Context, id string) (bool, error) 
 	err := s.db.QueryRowContext(ctx, "SELECT state FROM projection_inbox WHERE id=?", id).Scan(&state)
 	return state == "applied", err
 }
+
+func (s *Store) HasPendingProjection(ctx context.Context) (bool, error) {
+	var pending bool
+	err := s.reader(ctx).QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM projection_inbox WHERE state='pending')").Scan(&pending)
+	return pending, err
+}

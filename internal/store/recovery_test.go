@@ -219,3 +219,70 @@ func TestUnknownOutgoingIsNeverLocallyInvented(t *testing.T) {
 		t.Fatal("uncertain send was projected as confirmed")
 	}
 }
+
+func TestHistoryChunksAccumulateAndTargetedRefreshPreservesFrontier(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	chat := "chunks@g.us"
+	anchor := HistoryAnchor{ID: "head", Timestamp: time.Unix(200, 0)}
+	if err = s.StartHistory(ctx, "backfill", chat, anchor); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.RecordHistoryChunk(ctx, "backfill", HistoryCoverage{Lower: time.Unix(100, 0), LowerID: "first", Upper: time.Unix(190, 0)}, "first"); err != nil {
+		t.Fatal(err)
+	}
+	// Final chunk can be newer than an earlier chunk; keep the true minimum.
+	if err = s.FinishHistory(ctx, "backfill", "complete", HistoryCoverage{Lower: time.Unix(150, 0), LowerID: "final", Boundary: "unknown"}, "final"); err != nil {
+		t.Fatal(err)
+	}
+	coverage, ok, err := s.HistoryCoverage(ctx, chat, anchor.ID)
+	if err != nil || !ok || coverage.LowerID != "first" {
+		t.Fatal("lost earlier chunk frontier", err)
+	}
+	var members int
+	if err = s.DB().QueryRow("SELECT COUNT(*) FROM history_members WHERE request_id='backfill'").Scan(&members); err != nil || members != 3 {
+		t.Fatalf("lost chunk membership: %d %v", members, err)
+	}
+	if err = s.StartHistory(ctx, "recent", chat, HistoryAnchor{ID: "new", Timestamp: time.Unix(300, 0)}, "targeted"); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.FinishHistory(ctx, "recent", "complete", HistoryCoverage{Lower: time.Unix(250, 0), LowerID: "recent-lower", Boundary: "exhausted"}, "recent-lower"); err != nil {
+		t.Fatal(err)
+	}
+	frontier, err := s.NextHistoryAnchor(ctx, chat)
+	if err != nil || frontier.ID != "first" {
+		t.Fatal("targeted refresh displaced historical frontier", err)
+	}
+	boundary, err := s.HistoryBoundary(ctx, chat)
+	if err != nil || boundary != "unknown" {
+		t.Fatal("targeted refresh poisoned older-history boundary", err)
+	}
+}
+
+func TestHistoryPurposeMigrationPreservesRecordedRequests(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.StartHistory(context.Background(), "existing", "chat", HistoryAnchor{ID: "real", Timestamp: time.Unix(100, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.DB().Exec("ALTER TABLE history_requests DROP COLUMN purpose"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var purpose string
+	if err = s.DB().QueryRow("SELECT purpose FROM history_requests WHERE id='existing'").Scan(&purpose); err != nil || purpose != "backfill" {
+		t.Fatal("history migration lost existing requests", err)
+	}
+}

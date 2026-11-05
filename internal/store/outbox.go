@@ -100,6 +100,6 @@ func (s *Store) AcceptMutation(ctx context.Context, id string) error {
 }
 func (s *Store) UnreconciledMessageWrites(ctx context.Context, chat string) (int, error) {
 	var count int
-	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM operations WHERE kind IN ('send','edit','revoke','delete_me') AND state IN ('unknown','submitting','accepted') AND (?='' OR chat_jid=?)", chat, chat).Scan(&count)
+	err := s.reader(ctx).QueryRowContext(ctx, "SELECT COUNT(*) FROM operations WHERE kind IN ('send','edit','revoke','delete_me') AND state IN ('unknown','submitting','accepted') AND (?='' OR chat_jid=?)", chat, chat).Scan(&count)
 	return count, err
 }

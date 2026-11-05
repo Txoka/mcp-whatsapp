@@ -21,7 +21,7 @@ This started as a fork of [lharries/whatsapp-mcp](https://github.com/lharries/wh
 - **LID resolution** — normalises `@lid` JIDs to real phone numbers for accurate contact matching.
 - **Sent-message storage** — outgoing messages are persisted locally; history coverage still depends on WhatsApp.
 - **Disappearing-message timers** — outgoing messages inherit the group chat's ephemeral timer automatically.
-- **Transparent history loading** — reads wait for required history batches; unconfirmed sync returns an error instead of a partial page.
+- **Transparent history loading** — recent reads allow a short sync window (default 3s), then return cached messages with an explicit warning if confirmation is incomplete.
 - **Extended tool surface** — 42 tools (see below): reactions, replies, edits, revoke, mark-read, typing, is-on-whatsapp, full group admin, blocklist, polls (create + vote + tally), contact cards, view-once flag, presence, privacy settings, and the profile "About" text.
 - **Single-instance enforcement** — a `flock(2)` on `store/.lock` prevents two `serve` processes racing on the same SQLite files.
 

@@ -10,7 +10,7 @@ import (
 
 const synchronizationSchema = `
 CREATE TABLE IF NOT EXISTS history_requests(
- id TEXT PRIMARY KEY,chat_jid TEXT NOT NULL,anchor_id TEXT NOT NULL,state TEXT NOT NULL,
+ id TEXT PRIMARY KEY,chat_jid TEXT NOT NULL,anchor_id TEXT NOT NULL,state TEXT NOT NULL,purpose TEXT NOT NULL DEFAULT 'backfill',
  lower_time TIMESTAMP,upper_time TIMESTAMP,lower_id TEXT,upper_id TEXT,lower_from_me BOOLEAN NOT NULL DEFAULT 0,
  boundary TEXT NOT NULL DEFAULT 'unknown',watermark INTEGER,started_at INTEGER NOT NULL,finished_at INTEGER);
 CREATE INDEX IF NOT EXISTS history_requests_chat ON history_requests(chat_jid,started_at);
@@ -32,21 +32,48 @@ type HistoryCoverage struct {
 	LowerFromMe                          bool
 }
 
-func (s *Store) StartHistory(ctx context.Context, id, chat string, anchor HistoryAnchor) error {
-	_, err := s.db.ExecContext(ctx, "INSERT INTO history_requests(id,chat_jid,anchor_id,upper_time,upper_id,state,started_at) VALUES(?,?,?,?,?,'pending',?)", id, chat, anchor.ID, anchor.Timestamp.UTC(), anchor.ID, time.Now().UnixMilli())
+func (s *Store) StartHistory(ctx context.Context, id, chat string, anchor HistoryAnchor, purposes ...string) error {
+	purpose := "backfill"
+	if len(purposes) > 0 {
+		purpose = purposes[0]
+	}
+	if purpose != "backfill" && purpose != "targeted" {
+		return fmt.Errorf("invalid history purpose")
+	}
+	_, err := s.db.ExecContext(ctx, "INSERT INTO history_requests(id,chat_jid,anchor_id,upper_time,upper_id,state,started_at,purpose) VALUES(?,?,?,?,?,'pending',?,?)", id, chat, anchor.ID, anchor.Timestamp.UTC(), anchor.ID, time.Now().UnixMilli(), purpose)
 	return err
 }
+
+// RecordHistoryChunk retains membership from every successfully imported chunk.
+// Pending chunks are not evidence of completed coverage until FinishHistory.
+func (s *Store) RecordHistoryChunk(ctx context.Context, id string, c HistoryCoverage, members ...string) error {
+	return s.saveHistoryChunk(ctx, id, "", c, members...)
+}
 func (s *Store) FinishHistory(ctx context.Context, id, state string, c HistoryCoverage, members ...string) error {
+	return s.saveHistoryChunk(ctx, id, state, c, members...)
+}
+func (s *Store) saveHistoryChunk(ctx context.Context, id, state string, c HistoryCoverage, members ...string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, "UPDATE history_requests SET state=?,lower_time=?,lower_id=?,lower_from_me=?,boundary=?,watermark=?,finished_at=? WHERE id=?", state, c.Lower.UTC(), c.LowerID, c.LowerFromMe, c.Boundary, c.Watermark, time.Now().UnixMilli(), id)
-	if err != nil {
+	var lower, upper sql.NullTime
+	var lid, uid sql.NullString
+	var fromMe bool
+	if err = tx.QueryRowContext(ctx, "SELECT lower_time,upper_time,lower_id,upper_id,lower_from_me FROM history_requests WHERE id=?", id).Scan(&lower, &upper, &lid, &uid, &fromMe); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO history_members(request_id,message_id) SELECT id,anchor_id FROM history_requests WHERE id=?", id); err != nil {
+	if !c.Lower.IsZero() && (!lower.Valid || lower.Time.IsZero() || c.Lower.Before(lower.Time) || (c.Lower.Equal(lower.Time) && c.LowerID < lid.String)) {
+		lower = sql.NullTime{Time: c.Lower.UTC(), Valid: true}
+		lid = sql.NullString{String: c.LowerID, Valid: true}
+		fromMe = c.LowerFromMe
+	}
+	if !c.Upper.IsZero() && (!upper.Valid || c.Upper.After(upper.Time)) {
+		upper = sql.NullTime{Time: c.Upper.UTC(), Valid: true}
+		uid = sql.NullString{String: c.UpperID, Valid: true}
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE history_requests SET lower_time=?,lower_id=?,lower_from_me=?,upper_time=?,upper_id=?,watermark=? WHERE id=?", lower, lid, fromMe, upper, uid, c.Watermark, id); err != nil {
 		return err
 	}
 	for _, member := range members {
@@ -54,6 +81,14 @@ func (s *Store) FinishHistory(ctx context.Context, id, state string, c HistoryCo
 			continue
 		}
 		if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO history_members(request_id,message_id) VALUES(?,?)", id, member); err != nil {
+			return err
+		}
+	}
+	if state != "" {
+		if _, err = tx.ExecContext(ctx, "UPDATE history_requests SET state=?,boundary=?,finished_at=? WHERE id=?", state, c.Boundary, time.Now().UnixMilli(), id); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO history_members(request_id,message_id) SELECT id,anchor_id FROM history_requests WHERE id=?", id); err != nil {
 			return err
 		}
 	}
@@ -163,20 +198,17 @@ func (s *Store) NextHistoryAnchor(ctx context.Context, chat string) (HistoryAnch
 	if unknown, err := s.UnconfirmedHead(ctx, chat); err != nil {
 		return HistoryAnchor{}, err
 	} else if unknown {
-		var head HistoryAnchor
-		head.ID, head.Timestamp, head.IsFromMe, err = s.GetNewestMessage(chat)
-		return head, err
+		return s.NewestHistoryAnchor(ctx, chat)
 	}
 	var a HistoryAnchor
-	err := s.db.QueryRowContext(ctx, "SELECT lower_id,lower_time,lower_from_me FROM history_requests WHERE chat_jid=? AND state='complete' AND lower_id!='' ORDER BY finished_at DESC,rowid DESC LIMIT 1", chat).Scan(&a.ID, &a.Timestamp, &a.IsFromMe)
+	err := s.db.QueryRowContext(ctx, "SELECT lower_id,lower_time,lower_from_me FROM history_requests WHERE chat_jid=? AND state='complete' AND purpose='backfill' AND lower_id!='' ORDER BY finished_at DESC,rowid DESC LIMIT 1", chat).Scan(&a.ID, &a.Timestamp, &a.IsFromMe)
 	if err == nil {
 		return a, nil
 	}
 	if err != sql.ErrNoRows {
 		return a, err
 	}
-	a.ID, a.Timestamp, a.IsFromMe, err = s.GetNewestMessage(chat)
-	return a, err
+	return s.NewestHistoryAnchor(ctx, chat)
 }
 func (s *Store) CoversMessages(ctx context.Context, chat string, messages []Message) (bool, error) {
 	if len(messages) == 0 {
@@ -222,7 +254,7 @@ func (s *Store) CoversMessages(ctx context.Context, chat string, messages []Mess
 }
 func (s *Store) HistoryBoundary(ctx context.Context, chat string) (string, error) {
 	var boundary string
-	err := s.db.QueryRowContext(ctx, "SELECT boundary FROM history_requests WHERE chat_jid=? AND state='complete' AND boundary IN ('exhausted','inaccessible') ORDER BY finished_at DESC,rowid DESC LIMIT 1", chat).Scan(&boundary)
+	err := s.db.QueryRowContext(ctx, "SELECT boundary FROM history_requests WHERE chat_jid=? AND state='complete' AND purpose='backfill' AND boundary IN ('exhausted','inaccessible') ORDER BY finished_at DESC,rowid DESC LIMIT 1", chat).Scan(&boundary)
 	if err == sql.ErrNoRows {
 		return "unknown", nil
 	}
@@ -231,7 +263,7 @@ func (s *Store) HistoryBoundary(ctx context.Context, chat string) (string, error
 
 func (s *Store) UnconfirmedHead(ctx context.Context, chat string) (bool, error) {
 	var unknown bool
-	err := s.reader(ctx).QueryRowContext(ctx, `SELECT NOT EXISTS(SELECT 1 FROM history_members member JOIN history_requests request ON request.id=member.request_id WHERE request.chat_jid=messages.chat_jid AND request.state='complete' AND member.message_id=messages.id) FROM messages WHERE chat_jid=? ORDER BY timestamp DESC,id DESC LIMIT 1`, chat).Scan(&unknown)
+	err := s.reader(ctx).QueryRowContext(ctx, `SELECT NOT EXISTS(SELECT 1 FROM history_members member JOIN history_requests request ON request.id=member.request_id WHERE request.chat_jid=messages.chat_jid AND request.state='complete' AND member.message_id=messages.id) FROM messages WHERE chat_jid=? ORDER BY julianday(timestamp) DESC,id DESC LIMIT 1`, chat).Scan(&unknown)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
@@ -243,5 +275,38 @@ func (s *Store) UnconfirmedHead(ctx context.Context, chat string) (bool, error) 
 func (s *Store) CaptionRepairAnchor(ctx context.Context, chat string, after time.Time) (HistoryAnchor, error) {
 	var anchor HistoryAnchor
 	err := s.reader(ctx).QueryRowContext(ctx, "SELECT id,timestamp,is_from_me FROM messages WHERE chat_jid=? AND timestamp>? ORDER BY timestamp ASC,id ASC LIMIT 1", chat, after.UTC()).Scan(&anchor.ID, &anchor.Timestamp, &anchor.IsFromMe)
+	return anchor, err
+}
+
+func migrateHistorySchema(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA table_info(history_requests)")
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, kind string
+		var def sql.NullString
+		if err = rows.Scan(&cid, &name, &kind, &notnull, &def, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		found = found || name == "purpose"
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	if !found {
+		_, err = db.Exec("ALTER TABLE history_requests ADD COLUMN purpose TEXT NOT NULL DEFAULT 'backfill'")
+	}
+	return err
+}
+
+func (s *Store) NewestHistoryAnchor(ctx context.Context, chat string) (HistoryAnchor, error) {
+	var anchor HistoryAnchor
+	err := s.reader(ctx).QueryRowContext(ctx, "SELECT id,timestamp,is_from_me FROM messages WHERE chat_jid=? ORDER BY julianday(timestamp) DESC,id DESC LIMIT 1", chat).Scan(&anchor.ID, &anchor.Timestamp, &anchor.IsFromMe)
 	return anchor, err
 }

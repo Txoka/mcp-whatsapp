@@ -11,13 +11,29 @@ import (
 )
 
 type fakeHistory struct {
-	s        *store.Store
-	calls    int
-	fail     bool
-	readyErr error
-	fetch    func(context.Context, string, bool) (client.HistoryBatch, error)
+	s           *store.Store
+	recentCalls int
+	policy      client.ReadPolicy
+	recent      func(context.Context, string) (client.HistoryBatch, error)
+	calls       int
+	fail        bool
+	readyErr    error
+	fetch       func(context.Context, string, bool) (client.HistoryBatch, error)
 }
 
+func (f *fakeHistory) ReadPolicy() client.ReadPolicy {
+	if f.policy.Timeout == 0 {
+		return client.DefaultReadPolicy()
+	}
+	return f.policy
+}
+func (f *fakeHistory) FetchRecentHistory(ctx context.Context, chat string) (client.HistoryBatch, error) {
+	f.recentCalls++
+	if f.recent != nil {
+		return f.recent(ctx, chat)
+	}
+	return client.HistoryBatch{}, nil
+}
 func (f *fakeHistory) Store() *store.Store                     { return f.s }
 func (f *fakeHistory) WaitReadReady(ctx context.Context) error { return f.readyErr }
 func (f *fakeHistory) FetchHistory(ctx context.Context, chat string, lid bool) (client.HistoryBatch, error) {
@@ -79,22 +95,22 @@ func TestAutomaticHistoryRequiresConfirmedCompletion(t *testing.T) {
 	ctx := context.Background()
 	p := store.ListMessagesParams{ChatJID: "123@s.whatsapp.net", Limit: 10}
 	h := &historyReader{}
-	messages, _, _, err := h.read(ctx, f, p)
-	if err == nil || len(messages) != 0 || f.calls != 0 {
+	messages, status, _, err := h.read(ctx, f, p)
+	if err != nil || len(messages) != 0 || f.calls != 0 || !strings.Contains(status, "no usable cached anchor") {
 		t.Fatal("empty cache fabricated a history boundary")
 	}
 	f.s.StoreMessage(ctx, store.Message{ID: "newer", ChatJID: p.ChatJID, Sender: "123", Content: "newer", Timestamp: time.Now()}, nil, nil, nil, 0)
-	messages, status, _, err := h.read(ctx, f, p)
+	messages, status, _, err = h.read(ctx, f, p)
 	if err != nil || len(messages) != 2 || f.calls != 1 || !strings.Contains(status, "no older") {
 		t.Fatalf("confirmed history not returned: %d %s %v", len(messages), status, err)
 	}
 	f.readyErr = fmt.Errorf("offline")
 	messages, _, _, err = h.read(ctx, f, p)
-	if err == nil || len(messages) != 0 {
-		t.Fatal("failed sync leaked cached partial messages")
+	if err != nil || len(messages) != 2 {
+		t.Fatal("available cache was withheld")
 	}
 }
-func TestHistoryTimeoutDoesNotReturnPartialMessages(t *testing.T) {
+func TestHistoryTimeoutReturnsCachedMessagesWithWarning(t *testing.T) {
 	f := testHistory(t)
 	chat := "123@s.whatsapp.net"
 	f.s.StoreMessage(context.Background(), store.Message{ID: "known", ChatJID: chat, Content: "known", Timestamp: time.Now()}, nil, nil, nil, 0)
@@ -102,11 +118,11 @@ func TestHistoryTimeoutDoesNotReturnPartialMessages(t *testing.T) {
 		<-ctx.Done()
 		return client.HistoryBatch{}, ctx.Err()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	messages, _, _, err := (&historyReader{}).read(ctx, f, store.ListMessagesParams{ChatJID: chat, Limit: 10})
-	if err == nil || len(messages) != 0 {
-		t.Fatal("unconfirmed request returned partial history")
+	f.policy = client.DefaultReadPolicy()
+	f.policy.RecentSyncTimeout = 20 * time.Millisecond
+	messages, status, _, err := (&historyReader{}).read(context.Background(), f, store.ListMessagesParams{ChatJID: chat, Limit: 10})
+	if err != nil || len(messages) != 1 || !strings.Contains(status, "Warning") {
+		t.Fatal("cache fallback failed", err)
 	}
 }
 func TestHistoryContinuesThroughMultipleCompletedBatches(t *testing.T) {
@@ -123,12 +139,15 @@ func TestHistoryContinuesThroughMultipleCompletedBatches(t *testing.T) {
 		t.Fatalf("stopped early: %d %d %v", len(messages), f.calls, err)
 	}
 }
-func TestFullCacheStillWaitsForCatchup(t *testing.T) {
+func TestFullCacheReturnsWarningWhenCatchupUnavailable(t *testing.T) {
 	f := testHistory(t)
+	chat := "123@s.whatsapp.net"
+	ctx := context.Background()
+	f.s.StoreMessage(ctx, store.Message{ID: "cached", ChatJID: chat, Content: "cached", Timestamp: time.Now()}, nil, nil, nil, 0)
 	f.readyErr = fmt.Errorf("catch-up incomplete")
-	messages, _, _, err := (&historyReader{}).read(context.Background(), f, store.ListMessagesParams{})
-	if err == nil || len(messages) != 0 {
-		t.Fatal("catch-up failure hidden")
+	messages, status, _, err := (&historyReader{}).read(ctx, f, store.ListMessagesParams{ChatJID: chat, Limit: 1})
+	if err != nil || len(messages) != 1 || f.calls != 0 || !strings.Contains(status, "Warning") {
+		t.Fatal("cache withheld or sync failure hidden", err)
 	}
 }
 func TestCursorPagingDoesNotRepeatAfterNewMessage(t *testing.T) {
@@ -241,8 +260,8 @@ func TestFullUnconfirmedCachePageStopsOnNoProgress(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	msgs, _, _, err := (&historyReader{}).read(ctx, emptyHistoryTransfer{f}, store.ListMessagesParams{ChatJID: chat, Limit: 5})
-	if err == nil || !strings.Contains(err.Error(), "no progress") || f.calls != 2 || len(msgs) != 0 {
+	msgs, status, _, err := (&historyReader{}).read(ctx, emptyHistoryTransfer{f}, store.ListMessagesParams{ChatJID: chat, Limit: 5})
+	if err != nil || !strings.Contains(status, "Warning") || f.calls != 0 || len(msgs) != 5 {
 		t.Fatalf("unbounded/incorrect read: calls=%d messages=%d error=%v", f.calls, len(msgs), err)
 	}
 }
@@ -288,5 +307,46 @@ func TestCompactCursorResumesAfterInsertionAndAcrossRestart(t *testing.T) {
 	next, _, _, err := h.read(ctx, f, p)
 	if err != nil || len(next) != 2 || next[0].ID != "1" || next[1].ID != "0" {
 		t.Fatalf("insert shifted continuation: %+v %v", next, err)
+	}
+}
+
+func TestRecentSyncDeadlineReturnsFreshCacheWithoutBackfill(t *testing.T) {
+	f := testHistory(t)
+	chat := "123@s.whatsapp.net"
+	ctx := context.Background()
+	now := time.Now()
+	for i := 0; i < 30; i++ {
+		f.s.StoreMessage(ctx, store.Message{ID: fmt.Sprint(i), ChatJID: chat, Content: "cached", Timestamp: now.Add(-time.Duration(i) * time.Second)}, nil, nil, nil, 0)
+	}
+	f.policy = client.DefaultReadPolicy()
+	f.policy.RecentSyncTimeout = 25 * time.Millisecond
+	f.recent = func(ctx context.Context, chat string) (client.HistoryBatch, error) {
+		// A normal incoming event can arrive while the history request is pending.
+		if err := f.s.StoreMessage(ctx, store.Message{ID: "new-arrival", ChatJID: chat, Content: "new", Timestamp: now.Add(time.Second)}, nil, nil, nil, 0); err != nil {
+			return client.HistoryBatch{}, err
+		}
+		<-ctx.Done()
+		return client.HistoryBatch{}, ctx.Err()
+	}
+	started := time.Now()
+	messages, status, _, err := (&historyReader{}).read(ctx, f, store.ListMessagesParams{ChatJID: chat, Limit: 30})
+	if err != nil || len(messages) != 30 || messages[0].ID != "new-arrival" || f.calls != 0 || f.recentCalls != 1 || !strings.Contains(status, "Warning") {
+		t.Fatalf("bad fallback: rows=%d history=%d recent=%d err=%v", len(messages), f.calls, f.recentCalls, err)
+	}
+	if elapsed := time.Since(started); elapsed < 20*time.Millisecond || elapsed > 300*time.Millisecond {
+		t.Fatalf("sync window not bounded: %v", elapsed)
+	}
+}
+func TestCompletedPageDoesNotWaitBehindOlderHistoryLane(t *testing.T) {
+	f := testHistory(t)
+	chat := "123@s.whatsapp.net"
+	ctx := context.Background()
+	f.s.StoreMessage(ctx, store.Message{ID: "cached", ChatJID: chat, Content: "cached", Timestamp: time.Now()}, nil, nil, nil, 0)
+	lane := &readLane{token: make(chan struct{}, 1), users: 1}
+	lane.token <- struct{}{}
+	h := &historyReader{lanes: map[string]*readLane{chat: lane}}
+	messages, _, _, err := h.read(ctx, f, store.ListMessagesParams{ChatJID: chat, Limit: 1})
+	if err != nil || len(messages) != 1 || f.calls != 0 || f.recentCalls != 1 {
+		t.Fatal("complete page blocked behind old backfill", err)
 	}
 }

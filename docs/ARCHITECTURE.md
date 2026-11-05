@@ -41,8 +41,9 @@ not use a second service, message broker, or model-managed synchronization.
    cannot replace an explicit newer edit. Conflicting votes at the same revision
    are not assigned a guessed order.
 5. History request submission, confirmed completion, exhaustion, inaccessibility,
-   timeout and interruption are separate states. Returned message keys must belong
-   to confirmed transfers before a selected history page is considered established.
+   timeout and interruption are separate states. Coverage is diagnostic: unconfirmed rows are returned with a warning, not
+   withheld. Membership accumulates across every imported chunk, and only an
+   explicitly completed request establishes confirmed transfer evidence.
 6. A successful network submission is not a guarantee of delivery to every device.
    Unknown writes are retained across restart and are not blindly repeated.
 7. Approval is enforced by the configured MCP client. Annotations describe effects;
@@ -60,7 +61,8 @@ The SDK's explicit server-backoff handling remains enabled.
 | `WHATSAPP_HISTORY_CONCURRENCY` | 1 | Maximum simultaneous history requests; compatibility/resource setting, not a claimed WhatsApp quota |
 | `WHATSAPP_HISTORY_QUEUE` | 64 | Active and queued history work budget |
 | `WHATSAPP_HISTORY_BATCH_SIZE` | 50 | SDK-recommended peer request size; not a documented hard maximum |
-| `WHATSAPP_READ_TIMEOUT` | 5m | Total synchronization budget, bounded by earlier client cancellation |
+| `WHATSAPP_READ_TIMEOUT` | 5m | Older-history/search synchronization budget, bounded by client cancellation |
+| `WHATSAPP_RECENT_SYNC_TIMEOUT` | 3s | Recent-message sync window before fresh committed-cache fallback |
 | `WHATSAPP_MAX_PAGE_SIZE` | 100 | Response row budget; use pagination |
 | `WHATSAPP_MAX_RESPONSE_BYTES` | 262144 | Cached-query response budget; excessive output returns an explicit resource error |
 
@@ -143,8 +145,8 @@ timestamps. Captured outgoing payloads are cleared after successful application.
 
 An already full cached page never counts as progress by itself. After a confirmed
 transfer, the reader checks coverage and the next real anchor. An unchanged
-frontier without sufficient coverage produces an explicit incomplete-history error
-(after the bounded PN/LID compatibility alternative), rather than repeatedly
+frontier without sufficient coverage stops the query
+(after the bounded PN/LID compatibility alternative), returning cached messages with a warning rather than repeatedly
 requesting the same batch until timeout. Live empty transfers do not certify that
 retained cached messages still exist on the primary device.
 
@@ -173,3 +175,25 @@ or guarantee that WhatsApp can supply older history. Page data can reflect later
 edits or deletions. Bookmarks have no automatic expiry, are private local database
 state, and are removed with that database. Each distinct continuation/filter pair
 uses one row; repeated empty waits at the same position reuse their reference.
+
+## Bounded recent reads
+
+A recent `list_messages` read gets one shared synchronization budget, default 3s.
+It waits for local catch-up and, if needed, makes at most one targeted peer request
+behind the newest real cached message. If the cache already has a full page, it
+never walks older history to revalidate individual rows. Targeted requests are
+marked separately and cannot move the older-history frontier or its terminal
+boundary. Complete cached pages do not wait behind the per-chat backfill lane.
+
+On timeout, no progress, inaccessible history or uncertain coverage, the tool
+re-reads the latest committed cache and attaches a warning. It may return fewer
+matches than requested; absence is not proof of an empty conversation. The final
+snapshot does not run the long synchronization gate again. Disconnection,
+unfinished imports, pending local projections and uncertain writes are exposed
+as cache-health warnings. Database/query failures and caller cancellation remain
+errors. Older searches/pages can load missing rows within their longer budget;
+they also stop loading as soon as enough cached matches exist.
+
+This is a bounded best-effort refresh, not a remote-phone snapshot barrier. A
+connected event stream, successful peer response or full SQL page cannot prove
+that every remote edit, deletion or message has been observed.

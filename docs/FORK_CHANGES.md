@@ -43,10 +43,11 @@ Disconnected or failed synchronization does not silently return cached data.
 
 A selected-chat query that needs more history waits for its correlated ON_DEMAND
 response to be imported. Partial chunks do not complete a request. Reads continue
-through completed batches, with the existing request cooldowns handled internally.
-The total synchronization budget is two minutes, subject to earlier cancellation.
+through completed batches, without fixed request cooldowns.
+Recent reads use a 3-second sync window; older searches/pages use the configured
+longer budget. Caller cancellation still applies.
 Timeout, import failure, missing correlation, or a response that cannot advance
-history without an explicit boundary returns an error and withholds partial rows.
+history without an explicit boundary returns cached rows with a warning.
 Concurrent reads of a chat share newly loaded data rather than fetching in parallel.
 
 Global searches and unread queries cover synchronized local state; they do not
@@ -97,3 +98,11 @@ page/next_page, and resource-limit errors replace silent clamping.
 
 - Compare message ordering, time bounds and cursor positions as timestamp instants,
   with expression indexes and a mixed-offset regression test.
+
+- Recent message reads use a configurable 3s sync window and at most one targeted
+  refresh for a full cache page. Uncertain/partial results carry warnings, not a
+  coverage veto. They never scan weeks of old history to revalidate live messages.
+- Final responses re-read a coherent committed snapshot, without repeating the
+  long read gate. Targeted refreshes cannot reset older-history frontiers.
+- Accumulate history membership/bounds across every chunk, rather than keeping
+  only the final chunk. This prevents false gaps and forward-moving frontiers.

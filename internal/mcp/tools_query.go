@@ -77,7 +77,7 @@ func (s *Server) registerListMessages() {
 		mcp.WithString("cursor", mcp.Description("Short next-page bookmark returned by this tool; copy unchanged with the same filters")),
 		mcp.WithString("format", mcp.Enum("compact", "detailed"), mcp.DefaultString("compact"), mcp.Description("compact: readable messages without transport IDs (default); detailed: exact message/chat IDs needed for replies, reactions, downloads or diagnostics")),
 		mcp.WithString("timezone", mcp.Description("IANA timezone for compact timestamps, e.g. Europe/Madrid; defaults to server TZ, otherwise UTC")),
-		mcp.WithDescription("Read WhatsApp messages after local catch-up and automatic history loading for a selected chat. Required history fetches wait for a correlated completed response; timeout or unconfirmed completion returns an error without partial messages. Returns compact local-time messages and an opaque next-page cursor when available. Results describe a local snapshot with explicitly limited coverage, not an authoritative current view of the phone; never interpret an incomplete cache as an empty conversation. Does not send chat messages or mark anything read. Use detailed format only when exact transport IDs are needed."),
+		mcp.WithDescription("Read WhatsApp messages after local catch-up and automatic history loading for a selected chat. Recent reads allow a short bounded synchronization window (default 3 seconds). If synchronization or coverage is incomplete, returns cached messages with an explicit warning. Older-history loading waits only when more rows are needed. Returns compact local-time messages and an opaque next-page cursor when available. Results describe a local snapshot with explicitly limited coverage, not an authoritative current view of the phone; never interpret an incomplete cache as an empty conversation. Does not send chat messages or mark anything read. Use detailed format only when exact transport IDs are needed."),
 		mcp.WithString("after", mcp.Description("ISO-8601 lower bound on message timestamp (exclusive; include timezone)")),
 		mcp.WithString("before", mcp.Description("ISO-8601 upper bound on message timestamp (exclusive; include timezone)")),
 		mcp.WithString("sender_phone_number", mcp.Description("filter to messages sent by this phone or JID ("+jidDesc+")")),
@@ -104,8 +104,6 @@ func (s *Server) registerListMessages() {
 			a.ChatJID = chat
 		}
 
-		ctx, cancel := context.WithTimeout(ctx, s.client.ReadPolicy().Timeout)
-		defer cancel()
 		if a.Format != "" && a.Format != "compact" && a.Format != "detailed" {
 			return mcp.NewToolResultError("format must be compact or detailed"), nil
 		}
@@ -174,12 +172,19 @@ func (s *Server) registerListMessages() {
 		if a.UnreadOnly {
 			domain = "unread"
 		}
-		result, readErr := s.cachedRead(ctx, func(ctx context.Context) (*mcp.CallToolResult, error) {
+		result, readErr := s.localSnapshotRead(ctx, func(ctx context.Context) (*mcp.CallToolResult, error) {
 			base := params
 			base.IncludeContext = false
 			msgs, err = s.client.Store().ListMessages(ctx, base)
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
+			}
+			warning, healthErr := s.client.CachedReadWarning(ctx, a.ChatJID, domain)
+			if healthErr != nil {
+				return mcp.NewToolResultError(healthErr.Error()), nil
+			}
+			if warning != "" {
+				status += " " + warning
 			}
 			cursor = nextCursor(params, msgs)
 			if params.IncludeContext {
@@ -207,7 +212,7 @@ func (s *Server) registerListMessages() {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 			return mcp.NewToolResultText(readingFooter(text, status, "")), nil
-		}, a.ChatJID, domain)
+		})
 		if readErr != nil || result == nil || result.IsError || cursor == "" {
 			return result, readErr
 		}

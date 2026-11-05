@@ -125,6 +125,10 @@ func Open(dir string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate schema: %w", err)
 	}
+	if err := migrateHistorySchema(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate history schema: %w", err)
+	}
 	// Tighten messages.db after schema has been applied (the file exists
 	// by then). IsNotExist-tolerate in case a future sqlite driver version
 	// defers file creation.

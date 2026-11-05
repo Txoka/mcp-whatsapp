@@ -6,6 +6,7 @@ import (
 	"github.com/sealjay/mcp-whatsapp/internal/store"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestUnknownDeletionIsNotResubmitted(t *testing.T) {
@@ -50,5 +51,19 @@ func TestReadPolicyRejectsInvalidOperatorConfiguration(t *testing.T) {
 	t.Setenv("WHATSAPP_HISTORY_CONCURRENCY", "0")
 	if _, err := readPolicyFromEnv(); err == nil {
 		t.Fatal("invalid concurrency silently accepted")
+	}
+}
+
+func TestRecentSyncWindowIsConfigurableAndPositive(t *testing.T) {
+	t.Setenv("WHATSAPP_RECENT_SYNC_TIMEOUT", "80ms")
+	p, err := readPolicyFromEnv()
+	if err != nil || p.RecentSyncTimeout != 80*time.Millisecond {
+		t.Fatal("recent sync policy not applied", err)
+	}
+	for _, bad := range []string{"0s", "-1s", "invalid"} {
+		t.Setenv("WHATSAPP_RECENT_SYNC_TIMEOUT", bad)
+		if _, err = readPolicyFromEnv(); err == nil {
+			t.Fatal("invalid recent sync window accepted", bad)
+		}
 	}
 }

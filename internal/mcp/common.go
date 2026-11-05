@@ -92,6 +92,12 @@ func (s *Server) cachedRead(ctx context.Context, read func(context.Context) (*mc
 	if err := s.client.WaitReadReadyFor(ctx, chat, domain); err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	return s.localSnapshotRead(ctx, read)
+}
+
+// localSnapshotRead returns a coherent committed cache without a network gate.
+// Callers must attach synchronization/coverage warnings when using this path.
+func (s *Server) localSnapshotRead(ctx context.Context, read func(context.Context) (*mcp.CallToolResult, error)) (*mcp.CallToolResult, error) {
 	var result *mcp.CallToolResult
 	snapshot, err := s.client.Store().ReadSnapshot(ctx, func(ctx context.Context) error { var err error; result, err = read(ctx); return err })
 	if err != nil {

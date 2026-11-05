@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -201,14 +202,10 @@ func (c *Client) completeHistory(evt *events.HistorySync, importErr error) {
 		if conv == nil || c.store.ResolveLIDToJID(conv.GetID()) != w.chat {
 			continue
 		}
+		final := importErr != nil || conv.GetEndOfHistoryTransfer() || conv.EndOfHistoryTransferType != nil || evt.Data.GetProgress() >= 100 || evt.Notification.GetProgress() >= 100
 		if importErr != nil {
 			w.err = importErr
 		} else {
-			final := conv.GetEndOfHistoryTransfer() || conv.EndOfHistoryTransferType != nil || evt.Data.GetProgress() >= 100 || evt.Notification.GetProgress() >= 100
-
-			if !final {
-				return
-			}
 			if conv.EndOfHistoryTransferType != nil {
 				w.result.Exhausted = conv.GetEndOfHistoryTransferType() == waHistorySync.Conversation_COMPLETE_AND_NO_MORE_MESSAGE_REMAIN_ON_PRIMARY
 				w.result.Inaccessible = conv.GetEndOfHistoryTransferType() == waHistorySync.Conversation_COMPLETE_ON_DEMAND_SYNC_WITH_MORE_MSG_ON_PRIMARY_BUT_NO_ACCESS
@@ -243,6 +240,13 @@ func (c *Client) completeHistory(evt *events.HistorySync, importErr error) {
 			if coverage.Upper.IsZero() || t.After(coverage.Upper) {
 				coverage.Upper = t
 				coverage.UpperID = key
+			}
+		}
+		if !final && w.err == nil {
+			if err := c.store.RecordHistoryChunk(context.Background(), id, coverage, members...); err == nil {
+				return
+			} else {
+				w.err = err
 			}
 		}
 		if coverage.Boundary == "exhausted" && coverage.Lower.IsZero() {
@@ -302,7 +306,11 @@ func (c *Client) fetchHistoryAt(ctx context.Context, chat string, useLID bool, r
 	if err != nil {
 		return HistoryBatch{}, err
 	}
-	if err = c.store.StartHistory(ctx, id, chat, anchor); err != nil {
+	purpose := "backfill"
+	if requested != nil {
+		purpose = "targeted"
+	}
+	if err = c.store.StartHistory(ctx, id, chat, anchor, purpose); err != nil {
 		return HistoryBatch{}, err
 	}
 	w := c.syncState.register(id, chat)
@@ -381,4 +389,54 @@ func collectionAffects(name, domain string) bool {
 	default:
 		return true
 	}
+}
+
+// FetchRecentHistory refreshes only the window behind the newest stored key.
+// It never advances the durable frontier used for walking older history.
+func (c *Client) FetchRecentHistory(ctx context.Context, chat string) (HistoryBatch, error) {
+	anchor, err := c.store.NewestHistoryAnchor(ctx, chat)
+	if err != nil {
+		return HistoryBatch{}, err
+	}
+	return c.fetchHistoryAt(ctx, chat, true, &anchor)
+}
+
+// CachedReadWarning describes local health without waiting for network work.
+// It is used only for message snapshots whose caller accepts an explicit warning.
+func (c *Client) CachedReadWarning(ctx context.Context, chat, domain string) (string, error) {
+	notes := []string{}
+	c.syncState.mu.Lock()
+	ready, active, failure := c.syncState.ready, c.syncState.active, c.syncState.failure
+	collectionFailed := false
+	for name, cause := range c.syncState.collections {
+		collectionFailed = collectionFailed || (cause != nil && collectionAffects(name, domain))
+	}
+	c.syncState.mu.Unlock()
+	if c.wa == nil || !c.wa.IsConnected() {
+		notes = append(notes, "WhatsApp is disconnected; showing cached messages")
+	}
+	if !ready || active > 0 {
+		notes = append(notes, "synchronization is still in progress")
+	}
+	if failure != nil || collectionFailed {
+		notes = append(notes, "some synchronized changes have an unresolved error")
+	}
+	pending, err := c.store.HasPendingProjection(ctx)
+	if err != nil {
+		return "", err
+	}
+	if pending {
+		notes = append(notes, "received changes are awaiting local replay")
+	}
+	unresolved, err := c.store.UnreconciledMessageWrites(ctx, chat)
+	if err != nil {
+		return "", err
+	}
+	if unresolved > 0 {
+		notes = append(notes, "some message changes have an unconfirmed outcome")
+	}
+	if len(notes) == 0 {
+		return "", nil
+	}
+	return "Warning: " + strings.Join(notes, "; ") + ".", nil
 }
