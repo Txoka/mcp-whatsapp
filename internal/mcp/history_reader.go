@@ -62,9 +62,6 @@ func applyCursor(p *store.ListMessagesParams, raw string) error {
 	if json.Unmarshal(data, &cursor) != nil || cursor.ID == "" || cursor.Chat == "" || cursor.Time.IsZero() || cursor.Filter != filterKey(*p) {
 		return fmt.Errorf("cursor: invalid or filters changed")
 	}
-	if p.Page != 0 {
-		return fmt.Errorf("cursor: cannot combine with page")
-	}
 	p.CursorTime, p.CursorChat, p.CursorID = cursor.Time, cursor.Chat, cursor.ID
 	return nil
 }

@@ -275,8 +275,7 @@ MIT Licence — see [LICENSE](LICENSE).
 ### Continuations
 
 For older messages, copy the short `cursor` from the returned “Next page” block
-into `list_messages` with the same filters. Do not increment it or combine it
-with `page`; numbered message pages are retained for older clients. For waits,
+into `list_messages` with the same filters. Do not increment it. Message history uses cursors only. For waits,
 copy the returned `cursor` into `wait_for_updates` with the same chat and `kind`.
 Page and watch bookmarks are separate, survive service restarts, and do not expose
-message identifiers. Legacy cursor formats remain accepted.
+message identifiers. Raw encoded/epoch cursors and numbered message pages are not accepted.

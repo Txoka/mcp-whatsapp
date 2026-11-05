@@ -87,7 +87,13 @@ page/next_page, and resource-limit errors replace silent clamping.
   operations without resending them after cancellation or restart.
 
 - Return compact persistent message-page/update-watch bookmarks, bound to their
-  filters and purpose; preserve old cursor formats and numbered message pages.
+  filters and purpose; reject raw cursor formats and remove numbered message pages.
 - Detect no-progress transfers even when the cached page is full. PN/LID fallback
   applies to direct chats only; groups do not repeat the same request under an
   identity mode that cannot apply to groups.
+
+- Remove the unused manual history-request API and speculative anchor fallback;
+  automatic history requests require an exact stored anchor and correlation ID.
+
+- Compare message ordering, time bounds and cursor positions as timestamp instants,
+  with expression indexes and a mixed-offset regression test.

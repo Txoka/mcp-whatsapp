@@ -160,10 +160,10 @@ requires authentication and the client still controls write approval.
 Page bookmarks are bound to the message filters; update bookmarks are bound to
 chat and event kind. Wrong-purpose, unknown and changed-filter bookmarks fail
 explicitly. Changing display format, display timezone or page size does not change
-the underlying message query. Old encoded page cursors and epoch/sequence update
-cursors remain accepted. Message `page` remains a compatibility option; use the
-returned bookmark and omit `page` for new calls. Never synthesize or increment a
-bookmark. Offset-based chat-list compatibility APIs are unchanged.
+the underlying message query. Only persisted bookmarks are accepted at the MCP boundary. Raw encoded page
+cursors, epoch/sequence update cursors and numbered message pages are rejected.
+Never synthesize or increment a bookmark. Chat-list/group/unread pagination is a
+separate existing API and is unchanged.
 
 Paging walks older messages from a real message key, so new head messages do not
 shift the next page. Update bookmarks resume an event stream and avoid missing

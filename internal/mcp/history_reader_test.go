@@ -207,6 +207,9 @@ func TestConcurrentReadsShareLoadedHistory(t *testing.T) {
 }
 func TestMessageSchemaHidesSyncPolicy(t *testing.T) {
 	schema := NewServer(nil, nil).MCP().ListTools()["list_messages"].Tool.InputSchema
+	if _, ok := schema.Properties["page"]; ok {
+		t.Fatal("offset paging exposed")
+	}
 	if _, ok := schema.Properties["auto_sync"]; ok {
 		t.Fatal("sync policy exposed")
 	}
@@ -285,9 +288,5 @@ func TestCompactCursorResumesAfterInsertionAndAcrossRestart(t *testing.T) {
 	next, _, _, err := h.read(ctx, f, p)
 	if err != nil || len(next) != 2 || next[0].ID != "1" || next[1].ID != "0" {
 		t.Fatalf("insert shifted continuation: %+v %v", next, err)
-	}
-	p.Page = 1
-	if applyCursor(&p, resolved) == nil {
-		t.Fatal("accepted page with cursor")
 	}
 }

@@ -90,14 +90,14 @@ func TestListMessages_Pagination(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 
-	page0, err := s.ListMessages(ctx, ListMessagesParams{Limit: 2, Page: 0})
+	page0, err := s.ListMessages(ctx, ListMessagesParams{Limit: 2})
 	if err != nil {
 		t.Fatalf("ListMessages page 0: %v", err)
 	}
 	if len(page0) != 2 {
 		t.Fatalf("page 0 should return 2, got %d", len(page0))
 	}
-	page1, err := s.ListMessages(ctx, ListMessagesParams{Limit: 2, Page: 1})
+	page1, err := s.ListMessages(ctx, ListMessagesParams{Limit: 2, CursorTime: page0[len(page0)-1].Timestamp, CursorChat: page0[len(page0)-1].ChatJID, CursorID: page0[len(page0)-1].ID})
 	if err != nil {
 		t.Fatalf("ListMessages page 1: %v", err)
 	}
@@ -477,41 +477,26 @@ func TestGetOldestMessage_EmptyChat(t *testing.T) {
 	}
 }
 
-func TestGetMessageAtOrBefore(t *testing.T) {
+func TestMessageCursorComparesInstantsNotTimestampSpellings(t *testing.T) {
 	s := openTestStore(t)
-
-	// Between a3 (01-03) and a4 (01-04): the newest at-or-before is a3.
-	id, ts, _, err := s.GetMessageAtOrBefore("447700000001@s.whatsapp.net", mustTime(t, "2026-01-03 12:00:00"))
-	if err != nil {
-		t.Fatalf("GetMessageAtOrBefore: %v", err)
+	ctx := context.Background()
+	chat := "instant@g.us"
+	if err := s.StoreChat(chat, "Time test", time.Now()); err != nil {
+		t.Fatal(err)
 	}
-	if id != "a3" {
-		t.Fatalf("expected a3, got %q", id)
+	for _, row := range []struct{ id, stamp string }{{"z", "2026-01-01 09:00:00"}, {"a", "2026-01-01 10:00:00+01:00"}} {
+		if _, err := s.db.Exec("INSERT INTO messages(id,chat_jid,sender,content,timestamp,is_from_me) VALUES(?,?,?,?,?,?)", row.id, chat, "123", "text", row.stamp, false); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if !ts.Equal(mustTime(t, "2026-01-03 09:10:00")) {
-		t.Fatalf("unexpected timestamp: %v", ts)
+	p := ListMessagesParams{ChatJID: chat, Limit: 1}
+	first, err := s.ListMessages(ctx, p)
+	if err != nil || len(first) != 1 || first[0].ID != "z" {
+		t.Fatalf("wrong instant/tie order: %+v %v", first, err)
 	}
-}
-
-func TestGetMessageAtOrBefore_Inclusive(t *testing.T) {
-	s := openTestStore(t)
-
-	// Exactly on a3's timestamp: the bound is inclusive.
-	id, _, _, err := s.GetMessageAtOrBefore("447700000001@s.whatsapp.net", mustTime(t, "2026-01-03 09:10:00"))
-	if err != nil {
-		t.Fatalf("GetMessageAtOrBefore: %v", err)
-	}
-	if id != "a3" {
-		t.Fatalf("expected a3 for an exact-timestamp bound, got %q", id)
-	}
-}
-
-func TestGetMessageAtOrBefore_NothingThatFarBack(t *testing.T) {
-	s := openTestStore(t)
-
-	// Older than every cached message: caller falls back to the oldest.
-	_, _, _, err := s.GetMessageAtOrBefore("447700000001@s.whatsapp.net", mustTime(t, "2020-01-01 00:00:00"))
-	if !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("expected sql.ErrNoRows, got %v", err)
+	p.CursorTime, p.CursorChat, p.CursorID = first[0].Timestamp, chat, first[0].ID
+	next, err := s.ListMessages(ctx, p)
+	if err != nil || len(next) != 1 || next[0].ID != "a" {
+		t.Fatalf("cursor repeated/skipped timestamp spelling: %+v %v", next, err)
 	}
 }

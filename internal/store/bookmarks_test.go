@@ -52,12 +52,15 @@ func TestBookmarksSurviveRestartAndRejectWrongScope(t *testing.T) {
 	if _, err = other.ResolveBookmark(ctx, "p", "original-filters", token); err == nil {
 		t.Fatal("foreign cache accepted")
 	}
-	for _, legacy := range []string{"", "old-encoded-page-cursor", "deadbeef.42"} {
-		got, err := s.ResolveBookmark(ctx, "p", "original-filters", legacy)
-		if err != nil || got != legacy {
-			t.Fatal("legacy cursor changed", err)
+	if raw, err := s.ResolveBookmark(ctx, "p", "original-filters", ""); err != nil || raw != "" {
+		t.Fatal("empty cursor must start a new query")
+	}
+	for _, legacy := range []string{"old-encoded-page-cursor", "deadbeef.42"} {
+		if _, err := s.ResolveBookmark(ctx, "p", "original-filters", legacy); err == nil {
+			t.Fatal("obsolete cursor accepted")
 		}
 	}
+
 }
 func TestConcurrentBookmarksReuseSamePosition(t *testing.T) {
 	s, err := Open(t.TempDir())

@@ -34,12 +34,12 @@ func (s *Store) PutBookmark(ctx context.Context, kind, scope, payload string) (s
 	return token, err
 }
 
-// ResolveBookmark accepts old wire cursors for compatibility; new references
-// must match both their purpose and original filters. Missing references fail
+// ResolveBookmark requires a persisted reference matching its purpose and
+// original filters. Missing references fail
 // explicitly instead of silently restarting pagination or a watch.
 func (s *Store) ResolveBookmark(ctx context.Context, kind, scope, token string) (string, error) {
-	if !strings.HasPrefix(token, "p_") && !strings.HasPrefix(token, "u_") {
-		return token, nil
+	if token == "" {
+		return "", nil
 	}
 	if !strings.HasPrefix(token, kind+"_") || len(token) != 24 {
 		return "", fmt.Errorf("cursor: wrong kind or invalid bookmark")

@@ -310,7 +310,7 @@ func (c *Client) fetchHistoryAt(ctx context.Context, chat string, useLID bool, r
 	defer func() { // uncompleted requests stay explicitly interrupted/timed out
 		c.store.DB().Exec("UPDATE history_requests SET state='unconfirmed',finished_at=? WHERE id=? AND state='pending'", time.Now().UnixMilli(), id)
 	}()
-	if _, err := c.requestHistorySync(ctx, chat, time.Time{}, AnchorOldest, c.ReadPolicy().HistoryBatch, useLID, id, anchor); err != nil {
+	if err := c.requestHistorySync(ctx, chat, anchor, c.ReadPolicy().HistoryBatch, useLID, id); err != nil {
 		return HistoryBatch{}, err
 	}
 	select {

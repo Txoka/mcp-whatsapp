@@ -28,7 +28,6 @@ type ListMessagesParams struct {
 	ChatJID        string
 	Query          string
 	Limit          int
-	Page           int
 	IncludeContext bool
 	ContextBefore  int
 	ContextAfter   int
@@ -41,10 +40,6 @@ func (s *Store) ListMessages(ctx context.Context, params ListMessagesParams) ([]
 	if limit <= 0 {
 		limit = 20
 	}
-	page := params.Page
-	if page < 0 || page > int(^uint(0)>>1)/limit {
-		return nil, fmt.Errorf("page outside supported offset range")
-	}
 
 	var (
 		whereClauses []string
@@ -55,15 +50,15 @@ func (s *Store) ListMessages(ctx context.Context, params ListMessagesParams) ([]
 		whereClauses = append(whereClauses, knownUnreadSQL)
 	}
 	if !params.CursorTime.IsZero() {
-		whereClauses = append(whereClauses, "(messages.timestamp < ? OR (messages.timestamp = ? AND (messages.chat_jid > ? OR (messages.chat_jid = ? AND messages.id < ?))))")
+		whereClauses = append(whereClauses, "(julianday(messages.timestamp) < julianday(?) OR (julianday(messages.timestamp) = julianday(?) AND (messages.chat_jid > ? OR (messages.chat_jid = ? AND messages.id < ?))))")
 		args = append(args, params.CursorTime, params.CursorTime, params.CursorChat, params.CursorChat, params.CursorID)
 	}
 	if !params.After.IsZero() {
-		whereClauses = append(whereClauses, "messages.timestamp > ?")
+		whereClauses = append(whereClauses, "julianday(messages.timestamp) > julianday(?)")
 		args = append(args, params.After.UTC())
 	}
 	if !params.Before.IsZero() {
-		whereClauses = append(whereClauses, "messages.timestamp < ?")
+		whereClauses = append(whereClauses, "julianday(messages.timestamp) < julianday(?)")
 		args = append(args, params.Before.UTC())
 	}
 	if params.SenderPhone != "" {
@@ -100,11 +95,9 @@ func (s *Store) ListMessages(ctx context.Context, params ListMessagesParams) ([]
 		b.WriteString(" WHERE ")
 		b.WriteString(strings.Join(whereClauses, " AND "))
 	}
-	b.WriteString(" ORDER BY messages.timestamp DESC, messages.chat_jid ASC, messages.id DESC")
-	b.WriteString(" LIMIT ? OFFSET ?")
-
-	offset := page * limit
-	args = append(args, limit, offset)
+	b.WriteString(" ORDER BY julianday(messages.timestamp) DESC, messages.chat_jid ASC, messages.id DESC")
+	b.WriteString(" LIMIT ?")
+	args = append(args, limit)
 
 	rows, err := s.reader(ctx).QueryContext(ctx, b.String(), args...)
 	if err != nil {

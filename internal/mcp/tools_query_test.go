@@ -87,3 +87,13 @@ func TestPairingStatus_AwaitingQRGenerating(t *testing.T) {
 		t.Errorf("detail = %v, want generating message", env["detail"])
 	}
 }
+
+func TestMessageListRejectsRemovedOffsetArgument(t *testing.T) {
+	server := NewServer(nil, nil)
+	request := mcp.CallToolRequest{}
+	request.Params.Arguments = map[string]any{"page": 1}
+	result, err := server.MCP().ListTools()["list_messages"].Handler(context.Background(), request)
+	if err != nil || result == nil || !result.IsError {
+		t.Fatal("obsolete page argument was silently ignored", err)
+	}
+}

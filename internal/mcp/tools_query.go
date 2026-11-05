@@ -66,7 +66,6 @@ type listMessagesArgs struct {
 	ChatJID           string `json:"chat_jid,omitempty"`
 	Query             string `json:"query,omitempty"`
 	Limit             int    `json:"limit,omitempty"`
-	Page              int    `json:"page,omitempty"`
 	IncludeContext    *bool  `json:"include_context,omitempty"`
 	ContextBefore     int    `json:"context_before,omitempty"`
 	ContextAfter      int    `json:"context_after,omitempty"`
@@ -75,7 +74,7 @@ type listMessagesArgs struct {
 func (s *Server) registerListMessages() {
 	tool := mcp.NewTool("list_messages",
 		mcp.WithBoolean("unread_only", mcp.DefaultBool(false), mcp.Description("only incoming messages with known unread identities/read watermarks; phone counts may include messages not identified in cache")),
-		mcp.WithString("cursor", mcp.Description("Short next-page bookmark returned by this tool; copy unchanged with the same filters; omit page")),
+		mcp.WithString("cursor", mcp.Description("Short next-page bookmark returned by this tool; copy unchanged with the same filters")),
 		mcp.WithString("format", mcp.Enum("compact", "detailed"), mcp.DefaultString("compact"), mcp.Description("compact: readable messages without transport IDs (default); detailed: exact message/chat IDs needed for replies, reactions, downloads or diagnostics")),
 		mcp.WithString("timezone", mcp.Description("IANA timezone for compact timestamps, e.g. Europe/Madrid; defaults to server TZ, otherwise UTC")),
 		mcp.WithDescription("Read WhatsApp messages after local catch-up and automatic history loading for a selected chat. Required history fetches wait for a correlated completed response; timeout or unconfirmed completion returns an error without partial messages. Returns compact local-time messages and an opaque next-page cursor when available. Results describe a local snapshot with explicitly limited coverage, not an authoritative current view of the phone; never interpret an incomplete cache as an empty conversation. Does not send chat messages or mark anything read. Use detailed format only when exact transport IDs are needed."),
@@ -85,7 +84,6 @@ func (s *Server) registerListMessages() {
 		mcp.WithString("chat_jid", mcp.Description("filter to messages in this chat ("+jidDesc+")")),
 		mcp.WithString("query", mcp.Description("case-insensitive substring to match within message body")),
 		mcp.WithNumber("limit", mcp.DefaultNumber(float64(min(20, s.client.ReadPolicy().MaxPage))), mcp.Description("max messages to return (default 20, subject to the configured page resource budget)")),
-		mcp.WithNumber("page", mcp.DefaultNumber(0), mcp.Description("legacy zero-based page index; prefer the returned next-page cursor")),
 		mcp.WithBoolean("include_context", mcp.DefaultBool(false), mcp.Description("if true, add surrounding messages to search matches; overlapping windows are deduplicated. Defaults to false for normal chat history")),
 		mcp.WithNumber("context_before", mcp.DefaultNumber(1), mcp.Description("messages to include before each match (default 1, capped at 20 server-side)")),
 		mcp.WithNumber("context_after", mcp.DefaultNumber(1), mcp.Description("messages to include after each match (default 1, capped at 20 server-side)")),
@@ -94,7 +92,10 @@ func (s *Server) registerListMessages() {
 		mcp.WithIdempotentHintAnnotation(true),
 		mcp.WithOpenWorldHintAnnotation(true),
 	)
-	s.registerTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, a listMessagesArgs) (*mcp.CallToolResult, error) {
+	s.registerTool(tool, mcp.NewTypedToolHandler(func(ctx context.Context, req mcp.CallToolRequest, a listMessagesArgs) (*mcp.CallToolResult, error) {
+		if _, present := req.GetArguments()["page"]; present {
+			return mcp.NewToolResultError("page: unsupported; use the returned cursor to continue"), nil
+		}
 		if s.client != nil {
 			chat, err := s.readChatReference(a.ChatJID)
 			if err != nil {
@@ -140,7 +141,6 @@ func (s *Server) registerListMessages() {
 			ChatJID:        a.ChatJID,
 			Query:          a.Query,
 			Limit:          limit,
-			Page:           a.Page,
 			IncludeContext: a.IncludeContext != nil && *a.IncludeContext,
 			ContextBefore:  ctxBefore,
 			ContextAfter:   ctxAfter,
@@ -215,7 +215,7 @@ func (s *Server) registerListMessages() {
 		if err != nil {
 			return mcp.NewToolResultError("cursor: could not persist continuation; retry this read"), nil
 		}
-		result.Content = append(result.Content, mcp.NewTextContent("Next page: cursor="+strconv.Quote(bookmark)+" (reuse the same filters; do not increment page)."))
+		result.Content = append(result.Content, mcp.NewTextContent("Next page: cursor="+strconv.Quote(bookmark)+" (reuse the same filters)."))
 		return s.checkResponseBudget(result)
 
 	}))

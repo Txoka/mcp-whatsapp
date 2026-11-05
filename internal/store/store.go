@@ -239,21 +239,6 @@ func (s *Store) GetOldestMessage(chatJID string) (id string, ts time.Time, isFro
 	return
 }
 
-// GetMessageAtOrBefore returns the newest message row at or before ts for a
-// chat. It lets a caller anchor a history-sync request on a real cached
-// message near a requested point in time rather than fabricating a key that
-// the server cannot resolve. Returns sql.ErrNoRows when the chat has nothing
-// at or before ts.
-func (s *Store) GetMessageAtOrBefore(chatJID string, before time.Time) (id string, ts time.Time, isFromMe bool, err error) {
-	err = s.db.QueryRow(`
-		SELECT id, timestamp, is_from_me
-		FROM messages
-		WHERE chat_jid = ? AND timestamp <= ?
-		ORDER BY timestamp DESC
-		LIMIT 1`, chatJID, before).Scan(&id, &ts, &isFromMe)
-	return
-}
-
 // FindChatName returns the name stored for a chat JID, empty if none.
 func (s *Store) FindChatName(jid string) string {
 	var name string
@@ -316,6 +301,9 @@ CREATE TABLE IF NOT EXISTS messages (
 	PRIMARY KEY (id, chat_jid),
 	FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 );
+
+CREATE INDEX IF NOT EXISTS messages_page_instant ON messages(julianday(timestamp) DESC,chat_jid ASC,id DESC);
+CREATE INDEX IF NOT EXISTS messages_chat_instant ON messages(chat_jid,julianday(timestamp) DESC,id DESC);
 
 CREATE TABLE IF NOT EXISTS deleted_messages (
  chat_jid TEXT NOT NULL, message_id TEXT NOT NULL, PRIMARY KEY(chat_jid,message_id)
