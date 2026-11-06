@@ -1,5 +1,12 @@
 # Fork changes
 
+- Preserve conflicting same-timestamp poll observations without blocking unrelated
+  chat reads. Only the affected poll tally is unavailable until a newer server
+  revision resolves it. Import decoded poll updates from phone history, preserving
+  server millisecond timestamps and ignoring unknown option hashes rather than
+  treating them as withdrawals. History refresh can reconcile supplied revisions;
+  it is not proof of a complete current phone snapshot.
+
 Based on upstream commit `078ac8c5e3f8a6f32c6a5902e4859f86c853330f`.
 
 - Normal message reads use compact local-time output, with exact transport identifiers available in detailed mode.

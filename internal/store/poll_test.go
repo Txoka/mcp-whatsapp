@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -11,6 +13,102 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 )
+
+func TestPollConflictReplayDoesNotBlockOtherReads(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	chat, poll, voter := "poll-conflict@g.us", "poll-conflict", "voter@s.whatsapp.net"
+	ts := time.Date(2026, 11, 6, 18, 18, 53, 0, time.UTC)
+	if _, err := s.ApplyMessages(ctx, []MessageEvent{{
+		Message:     Message{ID: poll, ChatJID: chat, Content: "[poll] choose", Timestamp: ts},
+		PollOptions: []string{"a", "b"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StorePollVote(ctx, poll, chat, voter, []string{"a"}, ts); err != nil {
+		t.Fatal(err)
+	}
+	// Reproduce a captured withdrawal left pending by the previous version.
+	withdrawal, err := NewPollVoteEvent(poll, chat, voter, nil, ts.In(time.FixedZone("CET", 3600)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	withdrawal.Message.Content = "null" // Legacy encoding of an empty selection.
+	payload, err := json.Marshal(projectionInput{Events: []MessageEvent{withdrawal}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectionID := fmt.Sprintf("%x", sha256.Sum256(payload))
+	if _, err := s.db.Exec("INSERT INTO projection_inbox(id,payload,state) VALUES(?,?,'pending')", projectionID, payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplayPending(ctx, ""); err != nil {
+		t.Fatalf("poll conflict blocked global recovery: %v", err)
+	}
+	if err := s.ReplayPending(ctx, ""); err != nil {
+		t.Fatalf("repeated recovery failed: %v", err)
+	}
+	var pending, observations int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM projection_inbox WHERE state='pending'").Scan(&pending); err != nil || pending != 0 {
+		t.Fatalf("pending projections: %d, error: %v", pending, err)
+	}
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM poll_vote_conflicts").Scan(&observations); err != nil || observations != 2 {
+		t.Fatalf("conflicting observations not preserved: %d, error: %v", observations, err)
+	}
+	if _, _, err := s.GetPollResults(ctx, poll, chat); !errors.Is(err, ErrAmbiguousPollVotes) {
+		t.Fatalf("uncertain tally presented as known: %v", err)
+	}
+	unrelated := Message{ID: "unrelated", ChatJID: "other@g.us", Content: "still readable", Timestamp: ts}
+	if err := s.StoreMessage(ctx, unrelated, nil, nil, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetMessageContext(ctx, unrelated.ID, 0, 0, unrelated.ChatJID); err != nil {
+		t.Fatalf("unrelated read failed: %v", err)
+	}
+	if err := s.StorePollVote(ctx, poll, chat, voter, []string{"b"}, ts.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// Replaying the older withdrawal must not resurrect a resolved conflict.
+	if _, err := s.ApplyMessages(ctx, []MessageEvent{withdrawal}); err != nil {
+		t.Fatal(err)
+	}
+	_, tally, err := s.GetPollResults(ctx, poll, chat)
+	if err != nil || len(tally) != 2 || tally[0].Votes != 0 || tally[1].Votes != 1 {
+		t.Fatalf("newer vote did not resolve tally: %v, %v", tally, err)
+	}
+	if err := s.DeleteForMe(ctx, chat, poll); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM poll_vote_conflicts").Scan(&observations); err != nil || observations != 0 {
+		t.Fatalf("deleted poll retained conflict state: %d, %v", observations, err)
+	}
+}
+
+func TestEquivalentPollSelectionsAreNotConflicts(t *testing.T) {
+	for _, tc := range []struct {
+		name, stored string
+		selected     []string
+	}{
+		{"legacy-empty", "null", nil},
+		{"legacy-order-and-duplicates", `["b","a","a"]`, []string{"a", "b"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := openTestStore(t)
+			ctx := context.Background()
+			ts := time.Date(2026, 11, 6, 18, 0, 0, 0, time.UTC)
+			if _, err := s.db.Exec("INSERT INTO poll_votes VALUES('p','c','v',?,?)", tc.stored, ts); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.StorePollVote(ctx, "p", "c", "v", tc.selected, ts); err != nil {
+				t.Fatal(err)
+			}
+			var conflicts int
+			if err := s.db.QueryRow("SELECT COUNT(*) FROM poll_vote_conflicts").Scan(&conflicts); err != nil || conflicts != 0 {
+				t.Fatalf("equivalent selections marked as conflicts: %d, %v", conflicts, err)
+			}
+		})
+	}
+}
 
 func TestStorePollMetadata_RoundTrip(t *testing.T) {
 	s := openTestStore(t)

@@ -360,6 +360,7 @@ func (c *Client) handleHistorySync(historySync *events.HistorySync) {
 			nm.msg.ChatJID = chatJID
 
 			projected = append(projected, store.MessageEvent{Message: nm.msg, ChatName: name, LegacySender: senderUser, ContentUnknown: !contentKnown(raw), PollOptions: extractPollOptionNames(pollCreation(raw)), MediaKey: nm.mediaKey, FileSHA256: nm.fileSHA256, FileEncSHA256: nm.fileEncSHA256, FileLength: nm.fileLength})
+			projected = append(projected, c.historyPollVotes(ctx, rawChatJID, chatJID, ownID, msg.Message, extractPollOptionNames(pollCreation(raw)))...)
 
 		}
 	}

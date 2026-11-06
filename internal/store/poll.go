@@ -4,11 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
 	"time"
 )
+
+// ErrAmbiguousPollVotes prevents an uncertain poll tally from being reported as fact.
+var ErrAmbiguousPollVotes = errors.New("poll tally incomplete: conflicting votes at the same timestamp; a newer vote is needed to resolve the affected voter")
 
 // PollResult is one row of a poll tally.
 type PollResult struct {
@@ -80,7 +84,7 @@ func NewPollVoteEvent(pollMessageID, pollChatJID, voterJID string, selected []st
 	if pollMessageID == "" || pollChatJID == "" || voterJID == "" {
 		return MessageEvent{}, fmt.Errorf("poll vote requires original poll, chat and voter keys")
 	}
-	selected = append([]string(nil), selected...)
+	selected = append([]string{}, selected...)
 	sort.Strings(selected)
 	selected = slices.Compact(selected)
 	raw, err := json.Marshal(selected)
@@ -109,7 +113,28 @@ func applyPollVoteTx(ctx context.Context, tx *sql.Tx, m Message) error {
 		return nil
 	}
 	if err == nil && previous.Equal(m.Timestamp) && selected != m.Content {
-		return fmt.Errorf("conflicting poll votes at the same revision")
+		// Vote envelopes have limited timestamp precision. Preserve both observations
+		// instead of choosing an arbitrary winner or blocking every cached read.
+		// Normalize legacy null/unsorted selections before comparing them as sets.
+		var oldOptions, newOptions []string
+		if err := json.Unmarshal([]byte(selected), &oldOptions); err != nil {
+			return fmt.Errorf("decode stored poll vote: %w", err)
+		}
+		if err := json.Unmarshal([]byte(m.Content), &newOptions); err != nil {
+			return fmt.Errorf("decode incoming poll vote: %w", err)
+		}
+		sort.Strings(oldOptions)
+		sort.Strings(newOptions)
+		if !slices.Equal(slices.Compact(oldOptions), slices.Compact(newOptions)) {
+			for _, content := range []string{selected, m.Content} {
+				if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO poll_vote_conflicts
+					(poll_message_id,poll_chat_jid,voter_jid,timestamp,selected_options_json)
+					VALUES(?,?,?,?,?)`, m.ID, m.ChatJID, m.Sender, m.Timestamp.UTC(), content); err != nil {
+					return fmt.Errorf("capture conflicting poll vote: %w", err)
+				}
+			}
+			return nil
+		}
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO poll_votes(poll_message_id,poll_chat_jid,voter_jid,selected_options_json,timestamp) VALUES(?,?,?,?,?) ON CONFLICT(poll_message_id,poll_chat_jid,voter_jid) DO UPDATE SET selected_options_json=excluded.selected_options_json,timestamp=excluded.timestamp`, m.ID, m.ChatJID, m.Sender, m.Content, m.Timestamp.UTC())
 	return err
@@ -121,6 +146,18 @@ func (s *Store) GetPollResults(ctx context.Context, pollMessageID, pollChatJID s
 	opts, err := s.GetPollOptions(ctx, pollMessageID, pollChatJID)
 	if err != nil {
 		return nil, nil, err
+	}
+	var ambiguous bool
+	err = s.reader(ctx).QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM poll_vote_conflicts c JOIN poll_votes v
+		ON c.poll_message_id=v.poll_message_id AND c.poll_chat_jid=v.poll_chat_jid AND c.voter_jid=v.voter_jid
+		WHERE c.poll_message_id=? AND c.poll_chat_jid=? AND julianday(c.timestamp)>=julianday(v.timestamp)
+	)`, pollMessageID, pollChatJID).Scan(&ambiguous)
+	if err != nil {
+		return nil, nil, fmt.Errorf("check poll vote conflicts: %w", err)
+	}
+	if ambiguous {
+		return nil, nil, ErrAmbiguousPollVotes
 	}
 	rows, err := s.reader(ctx).QueryContext(ctx,
 		"SELECT selected_options_json FROM poll_votes WHERE poll_message_id = ? AND poll_chat_jid = ?",

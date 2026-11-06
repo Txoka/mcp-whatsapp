@@ -323,6 +323,14 @@ CREATE TABLE IF NOT EXISTS poll_votes (
 	timestamp TIMESTAMP NOT NULL,
 	PRIMARY KEY (poll_message_id, poll_chat_jid, voter_jid)
 );
+CREATE TABLE IF NOT EXISTS poll_vote_conflicts (
+	poll_message_id TEXT NOT NULL,
+	poll_chat_jid TEXT NOT NULL,
+	voter_jid TEXT NOT NULL,
+	timestamp TIMESTAMP NOT NULL,
+	selected_options_json TEXT NOT NULL,
+	PRIMARY KEY (poll_message_id, poll_chat_jid, voter_jid, timestamp, selected_options_json)
+);
 `
 
 // migrateSchema brings legacy databases up to the current layout. SQLite lacks

@@ -392,6 +392,7 @@ func deleteMessageTx(ctx context.Context, tx *sql.Tx, chat, id string) error {
 		{"DELETE FROM message_mentions WHERE chat_jid=? AND message_id=?", []any{chat, id}},
 		{"DELETE FROM message_read_state WHERE chat_jid=? AND message_id=?", []any{chat, id}},
 		{"DELETE FROM poll_votes WHERE poll_chat_jid=? AND poll_message_id=?", []any{chat, id}},
+		{"DELETE FROM poll_vote_conflicts WHERE poll_chat_jid=? AND poll_message_id=?", []any{chat, id}},
 		{"DELETE FROM message_revisions WHERE chat_jid=? AND message_id=?", []any{chat, id}},
 		{"DELETE FROM message_conflicts WHERE chat_jid=? AND message_id=?", []any{chat, id}},
 		{"DELETE FROM message_body_state WHERE chat_jid=? AND message_id=?", []any{chat, id}},
